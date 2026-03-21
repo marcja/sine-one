@@ -73,11 +73,11 @@ State machine:
   note_on()        attack complete      note_off()       level reaches 0
   ──────────►  Attack ──────────────► (holding) ──────► Release ──────────► Idle
                   ^                                         |
-                  └─────── note_on() from any state ────────┘  (retrigger resets to 0)
+                  └─────── note_on() from any state ────────┘  (retrigger from current level)
 ```
 
 State transition rules:
-- **`note_on()`**: always resets `level` to 0.0 and enters `Attack`
+- **`note_on()`**: enters `Attack` from the current level (preserves level on retrigger)
 - **Attack**: increments `level` by `1.0 / attack_samples` per sample; clamps at 1.0 (stays here
   until NoteOff arrives)
 - **`note_off()`**: enters `Release` from any non-Idle state. The release decrement is computed
@@ -238,7 +238,8 @@ Tests live in `#[cfg(test)]` blocks in the same file as the struct under test.
 - `hold_stays_at_one` — once attack completes, level remains 1.0 until `note_off()` is called
 - `release_ramps_down` — after `note_off()`, samples decrease monotonically
 - `release_reaches_idle` — after enough samples, state is `Idle` and level is 0.0
-- `retrigger_resets_level` — calling `note_on()` during release resets level to 0.0
+- `retrigger_preserves_level` — calling `note_on()` mid-attack preserves the current level
+- `retrigger_during_release_preserves_level` — calling `note_on()` mid-release preserves the current level
 
 **`params.rs`:**
 - `param_defaults_in_range` — verify each param's default value is within its declared min/max
@@ -439,7 +440,7 @@ cargo run -p sine_one --features standalone -- --output "Built-in Output"
    note should fade out after key release
 5. **Fine tune works** — automate Fine Tune from -100 to +100 cents; pitch should sweep smoothly
 6. **State save/load** — save project, close, reopen; parameters restore correctly
-7. **No click on retrigger** — rapid MIDI notes should not produce audible clicks
+7. **Smooth retrigger** — rapid MIDI notes should not produce audible clicks or dips to silence
 
 ---
 
@@ -462,10 +463,9 @@ Make it executable: `chmod +x .git/hooks/pre-commit`
 
 ## Open Questions
 
-1. **Retrigger from mid-release**: Currently, `note_on()` during release resets level to 0.0 and
-   restarts attack. An alternative is to retrigger from the current release level (no dip). The
-   zero-reset approach is simpler and slightly more audible as an attack. Revisit if legato
-   behavior is desired.
+1. **~~Retrigger from mid-release~~** *(resolved)*: `note_on()` now preserves the current level
+   and re-enters Attack from wherever the envelope is. This avoids the audible dip to zero on
+   fast retrigger and produces smoother legato behavior.
 
 2. **Velocity curve**: The current `velocity / 127.0` is linear (fully linear velocity response).
    A quadratic or logarithmic curve (`velocity^2 / 127^2`) often feels more natural on keyboards.

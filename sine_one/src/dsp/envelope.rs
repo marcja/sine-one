@@ -2,13 +2,13 @@
 ///
 /// State machine:
 ///   note_on() → Attack → (level reaches 1.0, holds) → note_off() → Release → (level reaches 0) → Idle
-///   note_on() from any state → resets level to 0.0 and enters Attack
+///   note_on() from any state → enters Attack from current level (no reset to 0.0)
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum EnvState {
     /// Silent — outputs 0.0 continuously.
     #[default]
     Idle,
-    /// Level is ramping up from 0.0 toward 1.0 (or holding at 1.0 after attack completes).
+    /// Level is ramping up toward 1.0 (or holding at 1.0 after attack completes).
     Attack,
     /// Level is ramping down toward 0.0 from wherever it was when note_off() was called.
     Release,
@@ -16,7 +16,7 @@ pub enum EnvState {
 
 /// A linear Attack/Release envelope generator.
 ///
-/// - `note_on()` always resets level to 0.0 and enters Attack.
+/// - `note_on()` enters Attack from the current level (preserves level on retrigger).
 /// - During Attack, level increments by `attack_increment` (= 1.0 / attack_samples) each sample,
 ///   clamping at 1.0 and holding there until `note_off()`.
 /// - `note_off()` enters Release from any non-Idle state. The release decrement is computed
@@ -57,12 +57,9 @@ impl ArEnvelope {
         self.release_samples = (release_ms * sample_rate / 1000.0).max(1.0);
     }
 
-    /// Trigger the attack phase. Resets level to 0.0 regardless of current state.
+    /// Trigger the attack phase. Preserves the current level so retrigger
+    /// during release produces a smooth ramp rather than an audible dip to zero.
     pub fn note_on(&mut self) {
-        // TODO(retrigger): currently resets level to 0.0 on NoteOn mid-release;
-        //   consider retriggering from current level for smoother legato behavior.
-        //   See docs/design.md "Open Questions #1".
-        self.level = 0.0;
         self.state = EnvState::Attack;
     }
 
@@ -245,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn retrigger_resets_level() {
+    fn retrigger_preserves_level() {
         let mut env = make_envelope(10.0, 100.0);
         env.note_on();
 
@@ -253,16 +250,59 @@ mod tests {
         for _ in 0..200 {
             env.next_sample();
         }
-        assert!(env.level > 0.0, "level should be nonzero mid-attack");
+        let level_before = env.level;
+        assert!(level_before > 0.0, "level should be nonzero mid-attack");
 
-        // Retrigger.
+        // Retrigger — level should be preserved and state should be Attack.
         env.note_on();
+        assert_eq!(
+            env.state,
+            EnvState::Attack,
+            "state should be Attack after retrigger"
+        );
 
-        // Level should be reset to 0.0 and first output near zero.
         let sample = env.next_sample();
         assert!(
-            sample < 0.01,
-            "retrigger should reset level near 0.0, got {sample}"
+            sample >= level_before,
+            "retrigger should preserve level (expected >= {level_before}, got {sample})"
+        );
+    }
+
+    #[test]
+    fn retrigger_during_release_preserves_level() {
+        let mut env = make_envelope(10.0, 100.0);
+        env.note_on();
+
+        // Complete attack phase.
+        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        for _ in 0..attack_samples + 10 {
+            env.next_sample();
+        }
+
+        // Enter release and advance partway.
+        env.note_off();
+        for _ in 0..500 {
+            env.next_sample();
+        }
+
+        let level_before = env.level;
+        assert!(
+            level_before > 0.0 && level_before < 1.0,
+            "level should be mid-release, got {level_before}"
+        );
+
+        // Retrigger mid-release — level should be preserved and state should be Attack.
+        env.note_on();
+        assert_eq!(
+            env.state,
+            EnvState::Attack,
+            "state should be Attack after retrigger"
+        );
+
+        let sample = env.next_sample();
+        assert!(
+            sample >= level_before,
+            "retrigger mid-release should preserve level (expected >= {level_before}, got {sample})"
         );
     }
 
