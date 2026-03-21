@@ -112,7 +112,7 @@ xattr -d com.apple.quarantine ~/Library/Audio/Plug-Ins/CLAP/SineOne.clap
 ### Standalone binary (no DAW needed)
 
 ```bash
-cargo run --features standalone -- --output "Built-in Output"
+cargo run -p sine_one --features standalone -- --output "Built-in Output"
 ```
 
 Opens the plugin with CPAL system audio. Send MIDI from any source and hear output without

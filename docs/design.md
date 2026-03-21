@@ -64,7 +64,8 @@ frequency  = base_freq * detune_mult
 
 ### ArEnvelope
 
-A four-state linear envelope:
+A three-state linear envelope (`EnvState::Idle`, `Attack`, `Release`). "Holding" is not a
+distinct state — it is the Attack state with level clamped at 1.0.
 
 ```
 State machine:
@@ -79,7 +80,10 @@ State transition rules:
 - **`note_on()`**: always resets `level` to 0.0 and enters `Attack`
 - **Attack**: increments `level` by `1.0 / attack_samples` per sample; clamps at 1.0 (stays here
   until NoteOff arrives)
-- **`note_off()`**: enters `Release` from any non-Idle state
+- **`note_off()`**: enters `Release` from any non-Idle state. The release decrement is computed
+  from the level at the moment `note_off()` is called, so a mid-attack release ramps from the
+  current level (not from 1.0). If level is 0.0 (e.g., note_off immediately after note_on),
+  transitions directly to Idle.
 - **Release**: decrements `level` by `current_level_at_release_start / release_samples` per sample
   (linear ramp from wherever the envelope currently is, to zero, over `release_samples`); when
   `level ≤ 0` → `Idle`
@@ -93,13 +97,15 @@ transients.)
 
 ### Velocity Scaling
 
-`velocity` (from the NoteOn event) is a `u8` 0–127. It scales the output:
+In nih-plug, `NoteEvent::NoteOn { velocity, .. }` provides velocity as an `f32` already
+normalized to [0.0, 1.0] (not a raw `u8` 0–127). The output is scaled directly:
 
 ```
-output = osc_sample * envelope_level * (velocity as f32 / 127.0)
+output = osc_sample * envelope_level * velocity
 ```
 
-This is stored on the plugin struct at note-on and applied in the process loop.
+This velocity value is stored on the plugin struct at note-on and applied per-sample in the
+process loop.
 
 ---
 
@@ -178,7 +184,7 @@ separate files so you can read each concern in isolation:
 # sine_one/Cargo.toml
 
 [lib]
-crate-type = ["cdylib"]   # required for plugin shared library
+crate-type = ["cdylib", "lib"]   # cdylib for plugin shared library; lib for tests/benches
 
 [features]
 standalone = ["nih_plug/standalone"]
@@ -190,6 +196,7 @@ required-features = ["standalone"]
 
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git",
+             default-features = false,
              features = ["assert_process_allocs"] }
 
 [dev-dependencies]
@@ -277,20 +284,29 @@ proptest! {
 
 ### Layer 3 — Integration tests (plugin lifecycle)
 
-Place in `sine_one/tests/lifecycle.rs`:
+These live in the `#[cfg(test)]` module at the bottom of `sine_one/src/plugin.rs`, using mock
+`InitContext` and `ProcessContext` implementations. They exercise the full plugin lifecycle
+(initialize → reset → process) without a real DAW or audio driver.
 
-- `initialize_returns_true` — construct `SineOne::default()`, call `initialize()` with a mock
-  `BufferConfig` (44100 Hz, 512 samples), verify it returns `true`
-- `silence_before_note_on` — call `process()` with a buffer of zeros and no MIDI events; output
-  must remain all zeros (no DC, no blowup from an uninitialized oscillator)
-- `note_on_produces_nonzero_output` — send a NoteOn(note=69, velocity=100) event, process a
-  buffer; at least some output samples should be nonzero
-- `note_off_eventually_silences` — after NoteOff with a short release time, output should reach
+Tests:
+- `plugin_can_be_constructed` — verify `SineOne::default()` creates a valid plugin and `params()`
+  returns a valid Arc
+- `initialize_stores_sample_rate` — call `initialize()` at 48000 Hz, verify `sample_rate` is cached
+- `initialize_returns_true_at_common_rates` — verify `initialize()` succeeds at 44100, 48000,
+  88200, 96000, and 192000 Hz
+- `reset_zeros_oscillator` — dirty the oscillator, call `reset()`, verify it matches a fresh one
+- `reset_zeros_envelope` — trigger the envelope, call `reset()`, verify it outputs 0.0 (Idle)
+- `reset_clears_note_and_velocity` — set active note and velocity, call `reset()`, verify both cleared
+- `silence_before_note_on` — process 512 samples with no MIDI events; output must be all zeros
+- `note_on_produces_nonzero_output` — send NoteOn(note=69, velocity≈0.79), process 512 samples;
+  at least some output should be nonzero
+- `note_off_eventually_silences` — after NoteOff with default release (300ms), output should reach
   zero within the expected number of samples
+- `both_channels_equal` — verify L and R channels carry identical output (mono duplication)
 
 **Pedagogical note:** These tests don't require a real DAW or audio driver. You instantiate the
-plugin struct directly and call its methods. This is the layer that confirms "does my plugin work
-end-to-end as a Rust program?" before you ever open Bitwig.
+plugin struct directly and call its methods with mock contexts. This is the layer that confirms
+"does my plugin work end-to-end as a Rust program?" before you ever open Bitwig.
 
 ### Layer 4 — CLAP compliance (`clap-validator`)
 
@@ -312,24 +328,32 @@ If this produces zero failures, you're safe to load in Bitwig.
 
 ### Performance Benchmarks (`criterion`)
 
-Target: process a 512-sample block in under 0.1ms (well under the ~11.6ms budget at 44100Hz).
-The DSP is trivial, so this benchmark is primarily teaching you the benchmark workflow.
+Target: process a 512-sample block well under the ~11.6ms budget at 44100 Hz.
+The DSP is trivial, so these benchmarks primarily teach the benchmark workflow.
+
+Three benchmarks in `benches/dsp_bench.rs`:
+- `oscillator_512_samples` — oscillator only, 512 samples at 440 Hz / 44100 Hz
+- `envelope_attack_512_samples` — envelope only, 512 samples during attack phase
+- `combined_dsp_512_samples` — oscillator × envelope × velocity, mirroring the per-sample work
+  in `process()`
 
 ```rust
-// benches/dsp_bench.rs
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+// benches/dsp_bench.rs (simplified)
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-fn bench_process_block(c: &mut Criterion) {
-    let mut group = c.benchmark_group("process");
-    group.throughput(Throughput::Elements(512));
-    group.bench_function("512_samples_note_held", |b| {
-        // Set up plugin with a held note, then time process()
-        b.iter(|| { /* call process() */ });
+fn oscillator_512_samples(c: &mut Criterion) {
+    c.bench_function("oscillator_512_samples", |b| {
+        let mut osc = SineOscillator::default();
+        osc.set_frequency(440.0, 44100.0);
+        b.iter(|| {
+            for _ in 0..512 {
+                black_box(osc.next_sample());
+            }
+        });
     });
-    group.finish();
 }
 
-criterion_group!(benches, bench_process_block);
+criterion_group!(benches, oscillator_512_samples, /* ... */);
 criterion_main!(benches);
 ```
 
@@ -401,7 +425,7 @@ xattr -d com.apple.quarantine ~/Library/Audio/Plug-Ins/CLAP/SineOne.clap
 ### Standalone Binary (GUI-less audio preview)
 
 ```bash
-cargo run --features standalone -- --output "Built-in Output"
+cargo run -p sine_one --features standalone -- --output "Built-in Output"
 # Opens plugin with CPAL audio; send MIDI from any source; hear output without Bitwig
 ```
 
