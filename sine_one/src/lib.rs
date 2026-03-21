@@ -1,3 +1,4 @@
+pub mod dsp;
 mod params;
 mod plugin;
 
