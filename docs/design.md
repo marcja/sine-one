@@ -147,6 +147,7 @@ is correct behavior.
 sine-one/
 ├── Cargo.toml              # workspace manifest
 ├── Cargo.lock
+├── bundler.toml            # [sine_one] name = "SineOne" — lives at workspace root
 ├── deploy.sh               # build + validate + install (see Build & Test Plan)
 ├── xtask/
 │   ├── Cargo.toml          # [dependencies] nih_plug_xtask = { git = "..." }
@@ -154,7 +155,6 @@ sine-one/
 │       └── main.rs         # fn main() { nih_plug_xtask::main() }
 └── sine_one/
     ├── Cargo.toml          # plugin crate (see Cargo.toml section below)
-    ├── bundler.toml        # [package.sine_one] name = "SineOne"
     └── src/
         ├── lib.rs          # nih_export_clap!(plugin::SineOne); re-exports
         ├── plugin.rs       # SineOne struct + Plugin trait impl (process, initialize, reset)

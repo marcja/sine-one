@@ -1,0 +1,28 @@
+[package]
+name = "sine_one"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+standalone = ["nih_plug/standalone"]
+
+[[bin]]
+name = "sine_one_standalone"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[dependencies]
+# default-features = false drops VST3 (and its GPL compatibility requirement).
+# Only CLAP is exported via nih_export_clap! in lib.rs.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default-features = false, features = ["assert_process_allocs"] }
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "dsp_bench"
+harness = false

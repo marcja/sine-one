@@ -41,6 +41,7 @@ cargo install cargo-watch      # optional: watch mode
 sine-one/
 ├── Cargo.toml              # workspace manifest
 ├── Cargo.lock
+├── bundler.toml            # tells xtask the bundle name ("SineOne")
 ├── deploy.sh               # build + validate + install in one step
 ├── README.md               # this file
 ├── xtask/                  # cargo xtask — handles .clap bundle creation
@@ -48,7 +49,6 @@ sine-one/
 │   └── src/main.rs
 └── sine_one/               # the plugin crate
     ├── Cargo.toml
-    ├── bundler.toml        # tells xtask the bundle name ("SineOne")
     └── src/
         ├── lib.rs          # nih_export_clap! macro entry point
         ├── plugin.rs       # SineOne struct + Plugin trait (initialize, reset, process)
