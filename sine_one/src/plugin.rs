@@ -92,13 +92,67 @@ impl Plugin for SineOne {
 
     fn process(
         &mut self,
-        _buffer: &mut Buffer,
+        buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // TODO(process): implement NoteOn/NoteOff event handling and
-        //   per-sample audio output once DSP structs are wired in.
-        //   Host pre-zeroes the buffer, so silence is the default output.
+        let mut next_event = context.next_event();
+
+        for (sample_idx, mut channel_samples) in buffer.iter_samples().enumerate() {
+            // Handle all MIDI events scheduled at this sample.
+            while let Some(event) = next_event {
+                if event.timing() != sample_idx as u32 {
+                    break;
+                }
+
+                match event {
+                    NoteEvent::NoteOn { note, velocity, .. } => {
+                        self.current_note = Some(note);
+                        // nih-plug normalizes velocity to [0.0, 1.0].
+                        self.current_velocity = velocity;
+
+                        // Compute frequency: MIDI note → Hz, with fine-tune offset.
+                        // REVIEW(fine_tune): reads .value() at NoteOn only — the Linear(20ms)
+                        //   smoother on fine_tune is not consumed per-sample. To support smooth
+                        //   pitch automation, read .smoothed.next() per-sample and update
+                        //   oscillator frequency in the audio loop. Deferred to keep process()
+                        //   simple for the first audible build.
+                        let base_freq = util::midi_note_to_freq(note);
+                        let fine_tune_cents = self.params.fine_tune.value();
+                        let freq = crate::dsp::oscillator::apply_detune(base_freq, fine_tune_cents);
+                        self.oscillator.set_frequency(freq, self.sample_rate);
+
+                        // Read attack time from params and trigger the envelope.
+                        self.envelope
+                            .set_attack(self.params.attack.value(), self.sample_rate);
+                        self.envelope.note_on();
+                    }
+                    NoteEvent::NoteOff { note, .. } => {
+                        // Only respond to NoteOff for the currently held note.
+                        if self.current_note == Some(note) {
+                            self.envelope
+                                .set_release(self.params.release.value(), self.sample_rate);
+                            self.envelope.note_off();
+                            self.current_note = None;
+                        }
+                    }
+                    _ => (),
+                }
+
+                next_event = context.next_event();
+            }
+
+            // Generate audio: oscillator × envelope × velocity.
+            let osc_sample = self.oscillator.next_sample();
+            let env_sample = self.envelope.next_sample();
+            let output = osc_sample * env_sample * self.current_velocity;
+
+            // Write identical mono signal to both stereo channels.
+            for sample in channel_samples.iter_mut() {
+                *sample = output;
+            }
+        }
+
         ProcessStatus::Normal
     }
 }
@@ -117,6 +171,8 @@ impl ClapPlugin for SineOne {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
     /// Minimal mock for `InitContext` — nih-plug does not expose test utilities,
@@ -129,6 +185,52 @@ mod tests {
         }
 
         fn execute(&self, _task: ()) {}
+
+        fn set_latency_samples(&self, _samples: u32) {}
+
+        fn set_current_voice_capacity(&self, _capacity: u32) {}
+    }
+
+    /// Mock `ProcessContext` that feeds a pre-built list of MIDI events.
+    /// Events are consumed in order by `next_event()`.
+    struct MockProcessContext {
+        events: VecDeque<NoteEvent<()>>,
+        transport: Transport,
+    }
+
+    impl MockProcessContext {
+        fn new(sample_rate: f32, events: Vec<NoteEvent<()>>) -> Self {
+            // HACK(transport): Transport::new() is pub(crate), so we zero-initialize
+            //   and set public fields. All pub(crate) fields are Option types that are
+            //   valid when zeroed (None). This is fragile if nih-plug adds non-zero-safe
+            //   fields — pin the nih-plug git dependency and revisit on updates.
+            let mut transport: Transport = unsafe { std::mem::zeroed() };
+            transport.sample_rate = sample_rate;
+            Self {
+                events: events.into(),
+                transport,
+            }
+        }
+    }
+
+    impl ProcessContext<SineOne> for MockProcessContext {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Clap
+        }
+
+        fn execute_background(&self, _task: ()) {}
+
+        fn execute_gui(&self, _task: ()) {}
+
+        fn transport(&self) -> &Transport {
+            &self.transport
+        }
+
+        fn next_event(&mut self) -> Option<NoteEvent<()>> {
+            self.events.pop_front()
+        }
+
+        fn send_event(&mut self, _event: NoteEvent<()>) {}
 
         fn set_latency_samples(&self, _samples: u32) {}
 
@@ -148,6 +250,31 @@ mod tests {
         let result = plugin.initialize(&layout, &config, &mut MockInitContext);
         assert!(result, "initialize() should return true");
         plugin
+    }
+
+    /// Helper: call `process()` on the plugin with a stereo buffer of the given
+    /// size and the provided MIDI events. Returns the left and right channel data.
+    fn run_process(
+        plugin: &mut SineOne,
+        num_samples: usize,
+        events: Vec<NoteEvent<()>>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut left = vec![0.0f32; num_samples];
+        let mut right = vec![0.0f32; num_samples];
+        let mut buffer = Buffer::default();
+        unsafe {
+            buffer.set_slices(num_samples, |output_slices| {
+                *output_slices = vec![&mut left, &mut right];
+            });
+        }
+        let mut aux = AuxiliaryBuffers {
+            inputs: &mut [],
+            outputs: &mut [],
+        };
+        let mut context = MockProcessContext::new(plugin.sample_rate, events);
+        let status = plugin.process(&mut buffer, &mut aux, &mut context);
+        assert_eq!(status, ProcessStatus::Normal);
+        (left, right)
     }
 
     #[test]
@@ -226,5 +353,99 @@ mod tests {
             plugin.current_velocity, 0.0,
             "current_velocity should be 0.0 after reset"
         );
+    }
+
+    #[test]
+    fn silence_before_note_on() {
+        let mut plugin = init_plugin(44100.0);
+
+        // Process 512 samples with no MIDI events — output must be all zeros.
+        let (left, right) = run_process(&mut plugin, 512, vec![]);
+
+        assert!(
+            left.iter().all(|&s| s == 0.0),
+            "left channel should be silent before any NoteOn"
+        );
+        assert!(
+            right.iter().all(|&s| s == 0.0),
+            "right channel should be silent before any NoteOn"
+        );
+    }
+
+    #[test]
+    fn note_on_produces_nonzero_output() {
+        let mut plugin = init_plugin(44100.0);
+
+        // Send NoteOn at sample 0: A4 (note 69), velocity ~0.79 (100/127).
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 100.0 / 127.0,
+        }];
+        let (left, _right) = run_process(&mut plugin, 512, events);
+
+        // At least some samples should be nonzero after the NoteOn triggers
+        // the oscillator and envelope.
+        let nonzero_count = left.iter().filter(|&&s| s != 0.0).count();
+        assert!(
+            nonzero_count > 0,
+            "expected nonzero output after NoteOn, but all 512 samples were zero"
+        );
+    }
+
+    #[test]
+    fn note_off_eventually_silences() {
+        let mut plugin = init_plugin(44100.0);
+
+        // NoteOn at sample 0.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        // Process enough samples to complete the attack phase (default 10 ms = 441 samples).
+        run_process(&mut plugin, 512, events);
+
+        // NoteOff at sample 0 of the next buffer.
+        let events = vec![NoteEvent::NoteOff {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 0.0,
+        }];
+        // Default release is 300 ms at 44100 Hz = 13230 samples. Process well beyond that.
+        let release_samples = (300.0 * 44100.0 / 1000.0) as usize; // 13230
+        let margin = 1000; // generous safety margin past release end
+        let total_samples = release_samples + margin + 2000;
+        let (left, _right) = run_process(&mut plugin, total_samples, events);
+
+        // The last samples should be zero (envelope has reached Idle).
+        let tail = &left[release_samples + margin..];
+        assert!(
+            tail.iter().all(|&s| s == 0.0),
+            "expected silence after release completes, but found nonzero samples in tail"
+        );
+    }
+
+    #[test]
+    fn both_channels_equal() {
+        let mut plugin = init_plugin(44100.0);
+
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        let (left, right) = run_process(&mut plugin, 256, events);
+
+        // Stereo output should be identical (mono signal duplicated).
+        assert_eq!(left, right, "left and right channels should be identical");
     }
 }
