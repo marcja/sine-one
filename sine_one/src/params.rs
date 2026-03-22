@@ -36,6 +36,12 @@ pub struct SineOneParams {
     /// 0° = sin(0) = 0.0 (cleanest sine start); 90° = sin(π/2) = 1.0 (peak).
     #[id = "start_phase"]
     pub start_phase: FloatParam,
+
+    /// Number of polyphonic voices (1–8).
+    /// At 1, the plugin behaves identically to monophonic mode.
+    /// Read at the start of each process block — no smoothing needed.
+    #[id = "voices"]
+    pub voices: IntParam,
 }
 
 impl Default for SineOneParams {
@@ -82,6 +88,8 @@ impl Default for SineOneParams {
             .with_step_size(0.1),
 
             start_phase: Self::build_start_phase(0.0),
+
+            voices: IntParam::new("Voices", 1, IntRange::Linear { min: 1, max: 8 }),
         }
     }
 }
@@ -157,6 +165,14 @@ mod tests {
             "start_phase default {sp_val} out of range"
         );
         assert_eq!(sp_val, 0.0, "start_phase default should be 0.0 degrees");
+
+        // Voices: range 1..8, default 1
+        let voices_val = params.voices.value();
+        assert!(
+            (1..=8).contains(&voices_val),
+            "voices default {voices_val} out of range"
+        );
+        assert_eq!(voices_val, 1, "voices default should be 1");
     }
 
     /// Verify that default values survive a normalize→unnormalize round-trip.
@@ -197,6 +213,11 @@ mod tests {
             (sp_plain - 0.0).abs() < 0.01,
             "start_phase round-trip: expected 0.0, got {sp_plain}"
         );
+
+        // Voices: Linear integer range 1..8, default 1.
+        let v_norm = params.voices.preview_normalized(1);
+        let v_plain = params.voices.preview_plain(v_norm);
+        assert_eq!(v_plain, 1, "voices round-trip: expected 1, got {v_plain}");
     }
 
     /// Verify that the normalized default values reported to the CLAP host
@@ -231,6 +252,13 @@ mod tests {
         assert!(
             sp_norm.abs() < 1e-6,
             "start_phase normalized default: expected 0.0, got {sp_norm}"
+        );
+
+        // Voices: Linear 1..8, default 1 → normalized 0.0.
+        let v_norm = params.voices.default_normalized_value();
+        assert!(
+            v_norm.abs() < 1e-6,
+            "voices normalized default: expected 0.0, got {v_norm}"
         );
     }
 }
