@@ -1,6 +1,6 @@
 # sine-one
 
-A minimal monophonic sine-wave synthesizer CLAP plugin built with [nih-plug](https://github.com/robbert-vdh/nih-plug).
+A minimal polyphonic sine-wave synthesizer CLAP plugin built with [nih-plug](https://github.com/robbert-vdh/nih-plug).
 
 This is an intentionally simple first plugin. The goal is a complete, working build/test/deploy
 workflow with every design decision documented — not a feature-rich instrument.
@@ -11,10 +11,24 @@ workflow with every design decision documented — not a feature-rich instrument
 
 - Accepts MIDI NoteOn / NoteOff
 - Plays a sine oscillator tuned to the incoming note and velocity
+- Polyphonic: 1–8 voices with voice stealing (oldest releasing, then oldest active)
 - Shapes the output with a linear AR (Attack/Release) envelope
 - Responds to **PolyPan** note expression events for stereo panning (e.g., from Bitwig's Randomize device)
-- Exposes three parameters: **Fine Tune** (±100 cents), **Attack** (1–5000 ms), **Release** (1–10000 ms)
-- No filter, no polyphony, no GUI
+- Attack-gated start-phase transient: short attacks (< 10 ms) allow an intentional amplitude pop from non-zero start phase; long attacks suppress it
+- Gain-compensated voice summing (1/√N) so perceived loudness stays constant as voice count changes
+- Click-free retriggers: velocity and pan ramp over ~2 ms on voice reuse; phase continues rather than resetting
+- No filter, no GUI
+
+### Parameters
+
+| Parameter | Range | Default | Notes |
+|---|---|---|---|
+| **Fine Tune** | ±100 cents | 0 ct | Smoothed at 20 ms for zipper-free automation |
+| **Attack** | 1–5000 ms | 10 ms | Log-skewed; read at note-on boundaries |
+| **Release** | 1–10000 ms | 300 ms | Log-skewed; read at note-off boundaries |
+| **Start Phase** | 0–360° | 0° | Oscillator phase on NoteOn from silence |
+| **Voices** | 1–8 | 1 | Polyphonic voice count; 1 = monophonic behavior |
+| **Output Gain** | −24 to +12 dB | 0 dB | Final scaling after voice gain compensation |
 
 ---
 
@@ -43,23 +57,29 @@ sine-one/
 ├── Cargo.toml              # workspace manifest
 ├── Cargo.lock
 ├── bundler.toml            # tells xtask the bundle name ("SineOne")
-├── deploy.sh               # build + validate + install in one step
 ├── README.md               # this file
-├── xtask/                  # cargo xtask — handles .clap bundle creation
+├── docs/
+│   ├── design.md           # full technical design document
+│   └── references/         # technical reference material
+├── xtask/                  # cargo xtask — handles .clap bundle creation + deploy
 │   ├── Cargo.toml
 │   └── src/main.rs
 └── sine_one/               # the plugin crate
     ├── Cargo.toml
+    ├── benches/
+    │   └── dsp_bench.rs    # criterion benchmarks (component, voice, realtime)
     └── src/
         ├── lib.rs          # nih_export_clap! macro entry point
         ├── plugin.rs       # SineOne struct + Plugin trait (initialize, reset, process)
-        ├── params.rs       # SineOneParams — the three CLAP parameters
+        ├── params.rs       # SineOneParams — six CLAP parameters
         ├── main.rs         # standalone binary entry point
         └── dsp/
             ├── mod.rs
             ├── oscillator.rs   # SineOscillator — phase accumulator + frequency math
             ├── envelope.rs     # ArEnvelope — Idle/Attack/Release state machine
-            └── pan.rs          # Constant-power stereo panning (sin/cos pan law)
+            ├── voice.rs        # Voice — per-voice DSP path + voice allocation
+            ├── pan.rs          # Constant-power stereo panning (sin/cos pan law)
+            └── smoother.rs     # LinearSmoother — click-free parameter ramps
 ```
 
 The split is intentional: `params.rs` is what the user controls, `dsp/` is the audio math,
@@ -98,7 +118,7 @@ with 50 random parameter permutations. Zero failures = safe to load in Bitwig.
 ### Build + validate + install in one step
 
 ```bash
-./deploy.sh
+cargo xtask deploy
 ```
 
 Then in Bitwig: **Preferences → Plug-ins → Rescan**.
@@ -128,9 +148,9 @@ Tests are organized in four layers:
 
 | Layer | Command | What it covers |
 |---|---|---|
-| Unit | `cargo test` | `SineOscillator` and `ArEnvelope` in isolation; parameter range checks |
-| Property-based | `cargo test` (included) | `proptest` — sine output always finite; envelope output always in [0.0, 1.0] |
-| Integration | `cargo test` (included) | Plugin lifecycle: initialize → reset → process; silence before NoteOn |
+| Unit | `cargo test` | DSP components in isolation (`SineOscillator`, `ArEnvelope`, `Voice`, `LinearSmoother`, `pan`); parameter range checks |
+| Property-based | `cargo test` (included) | `proptest` — sine output always finite; envelope output always in [0.0, 1.0]; constant-power pan across range |
+| Integration | `cargo test` (included) | Plugin lifecycle: initialize → reset → process; silence before NoteOn; polyphonic voice allocation and stealing; pan routing; gain compensation |
 | CLAP compliance | `clap-validator` (post-build) | Parameter round-trips, state save/load, fuzz pass |
 
 Run `cargo test` freely — it's fast, requires no audio hardware, and covers the first three layers.
@@ -142,9 +162,16 @@ Run `clap-validator` after every bundle before loading in Bitwig.
 cargo bench
 ```
 
-Measures process-block throughput (samples/sec) via `criterion`. Sets a regression baseline on
-first run; subsequent runs report statistical regressions. The target is processing a 512-sample
-block well under the ~11.6ms deadline at 44100 Hz.
+Criterion benchmarks are organized in three groups:
+
+| Group | What it measures |
+|---|---|
+| **component** | Individual DSP units: oscillator, envelope, combined osc×env, `apply_detune` — all at 512 samples |
+| **voice** | Single voice and 8-voice polyphonic rendering (512 samples) |
+| **realtime** | 8-voice 512-sample buffer vs. the 11.6 ms hardware deadline at 44100 Hz; computes real-time ratio (median time / deadline × 100%) |
+
+Sets a regression baseline on first run; subsequent runs report statistical regressions.
+HTML reports are generated in `target/criterion/`.
 
 ---
 
@@ -153,14 +180,20 @@ block well under the ~11.6ms deadline at 44100 Hz.
 After installing and rescanning, verify the following manually:
 
 1. Plugin appears in the Bitwig instrument browser under **SineOne**
-2. **Fine Tune**, **Attack**, and **Release** appear in the device panel with correct ranges
+2. All six parameters appear in the device panel with correct ranges
 3. A MIDI note produces a sine tone
-4. Attack = 500ms: note fades in audibly over half a second
-5. Release = 1000ms: note fades out after key release
+4. Attack = 500 ms: note fades in audibly over half a second
+5. Release = 1000 ms: note fades out after key release
 6. Fine Tune automated from −100 to +100 cents: pitch sweeps smoothly, no zipper noise
-7. Save project, close, reopen: all three parameters restore correctly
+7. Save project, close, reopen: all six parameters restore correctly
 8. Rapid repeated MIDI notes produce no audible clicks
 9. Randomize device → Pan: signal moves in the stereo field between notes
+10. Voices = 4: play a chord — all four notes sound simultaneously
+11. Voices = 1: play a chord — only the last note sounds (monophonic behavior)
+12. Change Voices from 4 to 2 while holding a chord — excess voices release gracefully, no clicks
+13. Start Phase = 90°, Attack = 1 ms: note begins with an intentional amplitude pop
+14. Start Phase = 0°, Attack = 1 ms: note begins cleanly (no pop)
+15. Output Gain = −12 dB: output is noticeably quieter than 0 dB
 
 ---
 
