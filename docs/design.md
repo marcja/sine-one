@@ -147,9 +147,12 @@ right.
 **Why constant-power instead of linear?** Linear panning (`left = (1-pan)/2`) causes a ~3 dB
 perceived volume dip at center. Constant-power avoids this and is the industry-standard approach.
 
-**Pan is not smoothed.** Changes apply instantly at the sample they arrive. For per-note pan
-from devices like Bitwig's Randomize, zipper noise is unlikely. If continuous pan automation is
-added later, a one-pole smoother could be inserted here.
+**Pan gains are smoothed over ~2ms.** When a PolyPan event changes the pan position, the
+left/right gains ramp linearly to their new values over ~2ms (`PAN_RAMP_SECS` in `voice.rs`)
+using the same `LinearSmoother` used for velocity crossfades. This prevents audible clicks in
+mono mode, where the single voice is still producing audio when pan changes arrive (e.g., from
+Bitwig's Randomize device). In polyphonic mode the attack envelope naturally masks pan changes,
+but the smoothing applies uniformly to all voices for consistency.
 
 **Pan persists across notes.** A PolyPan event sets the pan position until the next PolyPan or
 `reset()`. It is not reset on NoteOn. This matches the behavior of Bitwig's Randomize device,
@@ -515,7 +518,7 @@ criterion_main!(benches);
 - [x] No `Vec::push`, `String::new`, or any allocation in `process()`
 - [x] No `Mutex` or `RwLock` in `process()` (no GUI shared state in this plugin anyway)
 - [x] Voice array (`[Voice; 8]`) lives directly on the plugin struct (stack/inline), not in a `Box`
-- [x] Per-voice pan gains are cached at event-rate, avoiding per-sample sin/cos calls
+- [x] Per-voice pan gains are smoothed via stack-allocated `LinearSmoother` (no per-sample trig)
 
 ---
 
