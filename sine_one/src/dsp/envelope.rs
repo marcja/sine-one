@@ -17,8 +17,10 @@ pub enum EnvState {
 /// A linear Attack/Release envelope generator.
 ///
 /// - `note_on()` enters Attack from the current level (preserves level on retrigger).
-/// - During Attack, level increments by `attack_increment` (= 1.0 / attack_samples) each sample,
-///   clamping at 1.0 and holding there until `note_off()`.
+/// - During Attack, level increments by `attack_increment` (= (1.0 - level) / attack_samples)
+///   each sample, clamping at 1.0 and holding there until `note_off()`. The increment is
+///   scaled to the remaining distance so retrigger from a non-zero level still takes the
+///   full attack duration.
 /// - `note_off()` enters Release from any non-Idle state. The release decrement is computed
 ///   from the level at the moment note_off() is called, so a mid-attack release ramps from
 ///   the current level (not from 1.0).
@@ -28,8 +30,13 @@ pub struct ArEnvelope {
     state: EnvState,
     /// Current envelope amplitude in [0.0, 1.0].
     level: f32,
-    /// Per-sample increment during Attack: 1.0 / attack_samples.
+    /// Per-sample increment during Attack: (1.0 - level) / attack_samples.
+    /// Recomputed on each note_on() so retrigger from a non-zero level
+    /// still takes the full attack duration to reach 1.0.
     attack_increment: f32,
+    /// Duration of the attack phase in samples. Stored so note_on() can
+    /// recompute attack_increment from the current level.
+    attack_samples: f32,
     /// Per-sample decrement during Release: level_at_release_start / release_samples.
     release_decrement: f32,
     /// Number of samples in the release phase (stored so we can compute decrement on note_off).
@@ -43,9 +50,7 @@ impl ArEnvelope {
     /// `attack_ms` is clamped to a minimum of 1.0 to avoid division by zero.
     pub fn set_attack(&mut self, attack_ms: f32, sample_rate: f32) {
         // Convert milliseconds to samples: ms * (samples/sec) / (1000 ms/sec).
-        let attack_samples = (attack_ms * sample_rate / 1000.0).max(1.0);
-        // Increment per sample to ramp from 0.0 to 1.0 over attack_samples.
-        self.attack_increment = 1.0 / attack_samples;
+        self.attack_samples = (attack_ms * sample_rate / 1000.0).max(1.0);
     }
 
     /// Configure the release time. Call when sample rate changes or when the release parameter
@@ -60,6 +65,13 @@ impl ArEnvelope {
     /// Trigger the attack phase. Preserves the current level so retrigger
     /// during release produces a smooth ramp rather than an audible dip to zero.
     pub fn note_on(&mut self) {
+        // Compute increment from the remaining distance to 1.0 so that
+        // retrigger from a non-zero level still takes the full attack
+        // duration, producing a gentler slope instead of a truncated ramp.
+        // When level is already at 1.0, remaining is 0.0 and the increment
+        // becomes 0.0 — next_sample() will clamp and hold at 1.0.
+        let remaining = (1.0 - self.level).max(0.0);
+        self.attack_increment = remaining / self.attack_samples;
         self.state = EnvState::Attack;
     }
 
@@ -408,6 +420,66 @@ mod tests {
         assert!(
             !env.is_releasing(),
             "fresh envelope should not be releasing"
+        );
+    }
+
+    #[test]
+    fn retrigger_attack_duration_matches_full_attack() {
+        // When retriggering mid-release, the attack phase should still take
+        // the full attack_ms to reach 1.0 (scaled increment), not a fraction
+        // of it (fixed increment).
+        let attack_ms = 10.0;
+        let release_ms = 100.0;
+        let sr = 44100.0;
+        let attack_samples = (attack_ms * sr / 1000.0) as usize; // 441
+
+        let mut env = make_envelope(attack_ms, release_ms);
+        env.note_on();
+
+        // Complete attack + hold briefly.
+        for _ in 0..attack_samples + 10 {
+            env.next_sample();
+        }
+
+        // Release partway — level drops to ~0.5.
+        env.note_off();
+        let half_release = (release_ms * sr / 1000.0) as usize / 2;
+        for _ in 0..half_release {
+            env.next_sample();
+        }
+        let level_at_retrigger = env.level;
+        assert!(
+            level_at_retrigger > 0.3 && level_at_retrigger < 0.7,
+            "expected mid-release level, got {level_at_retrigger}"
+        );
+
+        // Retrigger — attack should take full attack_samples to reach 1.0.
+        env.set_attack(attack_ms, sr);
+        env.note_on();
+
+        // After 75% of the attack time, level should NOT yet be 1.0.
+        // With the bug (fixed increment 1/441), starting from ~0.5, level
+        // would reach 1.0 in ~50% of attack time and be clamped here.
+        // With the fix (scaled increment 0.5/441), level would be ~0.875.
+        let check_samples = attack_samples * 3 / 4;
+        for _ in 0..check_samples {
+            env.next_sample();
+        }
+        assert!(
+            env.level < 1.0,
+            "level should not reach 1.0 after 75% of attack time on retrigger, got {}",
+            env.level
+        );
+
+        // After the full attack time (plus margin), level should be 1.0.
+        let remaining_samples = attack_samples - check_samples + 10;
+        for _ in 0..remaining_samples {
+            env.next_sample();
+        }
+        assert!(
+            (env.level - 1.0).abs() < 1e-6,
+            "level should reach 1.0 after full attack time on retrigger, got {}",
+            env.level
         );
     }
 

@@ -84,8 +84,10 @@ State machine:
 ```
 
 State transition rules:
-- **`note_on()`**: enters `Attack` from the current level (preserves level on retrigger)
-- **Attack**: increments `level` by `1.0 / attack_samples` per sample; clamps at 1.0 (stays here
+- **`note_on()`**: enters `Attack` from the current level (preserves level on retrigger). The
+  attack increment is scaled to the remaining distance: `(1.0 - level) / attack_samples`, so
+  retrigger from a non-zero level still takes the full attack duration to reach 1.0.
+- **Attack**: increments `level` by `attack_increment` per sample; clamps at 1.0 (stays here
   until NoteOff arrives)
 - **`note_off()`**: enters `Release` from any non-Idle state. The release decrement is computed
   from the level at the moment `note_off()` is called, so a mid-attack release ramps from the
