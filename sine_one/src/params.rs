@@ -122,6 +122,15 @@ impl SineOneParams {
         params.start_phase = Self::build_start_phase(degrees);
         params
     }
+
+    /// Create params with a custom voice count for testing.
+    /// Works around nih-plug's `ParamMut` being `pub(crate)` by constructing
+    /// the `IntParam` with the desired value baked in as the default.
+    pub fn with_voices(voice_count: i32) -> Self {
+        let mut params = Self::default();
+        params.voices = IntParam::new("Voices", voice_count, IntRange::Linear { min: 1, max: 8 });
+        params
+    }
 }
 
 #[cfg(test)]

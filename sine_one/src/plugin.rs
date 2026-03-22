@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use nih_plug::prelude::*;
 
-use crate::dsp::voice::{NoteOnParams, Voice, MAX_VOICES};
+use crate::dsp::smoother::LinearSmoother;
+use crate::dsp::voice::{allocate_voice, NoteOnParams, Voice, MAX_VOICES};
 use crate::params::SineOneParams;
 
 /// A polyphonic sine-wave synthesizer CLAP plugin.
@@ -27,6 +28,12 @@ pub struct SineOne {
     /// each `note_on()` and assigned to the voice, so the allocator can
     /// identify the oldest voice for stealing.
     next_voice_age: u64,
+    /// Smooths the gain compensation factor (1.0 / voice_count) to avoid
+    /// clicks when the voice count parameter changes at runtime.
+    gain_smoother: LinearSmoother,
+    /// Previous voice count, used to detect runtime voice count changes
+    /// and release excess voices when the count decreases.
+    previous_voice_count: usize,
 }
 
 impl Default for SineOne {
@@ -36,6 +43,8 @@ impl Default for SineOne {
             sample_rate: 0.0,
             voices: core::array::from_fn(|_| Voice::default()),
             next_voice_age: 0,
+            gain_smoother: LinearSmoother::default(),
+            previous_voice_count: 1,
         }
     }
 }
@@ -74,6 +83,12 @@ impl Plugin for SineOne {
         // Cache sample rate for use in process() when computing frequencies
         // and envelope times from parameter values.
         self.sample_rate = buffer_config.sample_rate;
+
+        // Initialize gain compensation for the current voice count.
+        let voice_count = self.params.voices.value() as usize;
+        self.gain_smoother.set_immediate(1.0 / voice_count as f32);
+        self.previous_voice_count = voice_count;
+
         true
     }
 
@@ -83,6 +98,8 @@ impl Plugin for SineOne {
             voice.reset();
         }
         self.next_voice_age = 0;
+        self.gain_smoother.reset();
+        self.previous_voice_count = 1;
     }
 
     fn process(
@@ -93,9 +110,25 @@ impl Plugin for SineOne {
     ) -> ProcessStatus {
         let mut next_event = context.next_event();
 
-        // For this monophonic-compatible refactor, all events route to voices[0].
-        // The full polyphonic allocator is wired in a subsequent commit.
-        let voice = &mut self.voices[0];
+        // Read voice count once per process block.
+        let voice_count = (self.params.voices.value() as usize).clamp(1, MAX_VOICES);
+
+        // Detect voice count changes: release excess voices and update gain.
+        if voice_count != self.previous_voice_count {
+            if voice_count < self.previous_voice_count {
+                for voice in &mut self.voices[voice_count..self.previous_voice_count] {
+                    if !voice.is_idle() {
+                        voice.note_off(self.params.release.value(), self.sample_rate);
+                    }
+                }
+            }
+            self.previous_voice_count = voice_count;
+
+            // Smooth gain change over ~5ms to avoid clicks on voice count transitions.
+            let target_gain = 1.0 / voice_count as f32;
+            let ramp_samples = (0.005 * self.sample_rate) as u32;
+            self.gain_smoother.set_target(target_gain, ramp_samples);
+        }
 
         for (sample_idx, mut channel_samples) in buffer.iter_samples().enumerate() {
             // Handle all MIDI events scheduled at this sample.
@@ -106,11 +139,11 @@ impl Plugin for SineOne {
 
                 match event {
                     NoteEvent::NoteOn { note, velocity, .. } => {
-                        // Convert start_phase from degrees (0–360) to normalized [0, 1).
+                        let idx = allocate_voice(&self.voices, voice_count);
                         let start_phase_normalized = self.params.start_phase.value() / 360.0 % 1.0;
 
                         self.next_voice_age += 1;
-                        voice.note_on(NoteOnParams {
+                        self.voices[idx].note_on(NoteOnParams {
                             note,
                             velocity,
                             base_freq: util::midi_note_to_freq(note),
@@ -121,21 +154,29 @@ impl Plugin for SineOne {
                         });
                     }
                     NoteEvent::NoteOff { note, .. } => {
-                        // Only respond to NoteOff for the currently held note.
-                        if voice.note() == Some(note) {
-                            voice.note_off(self.params.release.value(), self.sample_rate);
+                        // NOTE(note_off_scan): Scan all MAX_VOICES slots, not just
+                        //   [..voice_count]. Voices beyond voice_count may still be
+                        //   releasing (after the user decreased the voice count) and
+                        //   need NoteOff handling to reach Idle.
+                        let target = self.voices[..MAX_VOICES]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| v.note() == Some(note))
+                            .min_by_key(|(_, v)| v.age());
+
+                        if let Some((idx, _)) = target {
+                            self.voices[idx]
+                                .note_off(self.params.release.value(), self.sample_rate);
                         }
                     }
-                    // NOTE(poly_pan): We accept all PolyPan events regardless of the
-                    //   note field. With voices=1, PolyPan may arrive before NoteOn in
-                    //   the same buffer (e.g., from Bitwig's Randomize device). Strict
-                    //   note matching would drop those events.
-                    // REVIEW(pan_smoothing): Pan changes apply instantly at the sample
-                    //   they arrive. If continuous pan automation causes audible zipper
-                    //   noise, add a one-pole smoother here. Unlikely for per-note pan
-                    //   from Bitwig's Randomize device.
+                    // TODO(poly_pan): Route pan to the voice matching this note
+                    //   event. Currently hardcoded to voices[0] for backward
+                    //   compatibility with monophonic behavior. With voices=1,
+                    //   accepting all PolyPan regardless of note field is correct
+                    //   since PolyPan may arrive before NoteOn in the same buffer
+                    //   (e.g., from Bitwig's Randomize device).
                     NoteEvent::PolyPan { pan, .. } => {
-                        voice.set_pan(pan);
+                        self.voices[0].set_pan(pan);
                     }
                     _ => (),
                 }
@@ -147,18 +188,30 @@ impl Plugin for SineOne {
             // pitch modulation (vibrato, automation). The smoother must be
             // consumed every sample even when no note is active.
             let fine_tune_cents = self.params.fine_tune.smoothed.next();
+            let gain = self.gain_smoother.next_sample();
 
-            // Generate audio from voice and write to stereo output.
-            let (left_sample, right_sample) =
-                voice.render_sample(fine_tune_cents, self.sample_rate);
+            // Sum all active voices.
+            let mut left_sum = 0.0_f32;
+            let mut right_sum = 0.0_f32;
+            for voice in &mut self.voices {
+                if !voice.is_idle() {
+                    let (l, r) = voice.render_sample(fine_tune_cents, self.sample_rate);
+                    left_sum += l;
+                    right_sum += r;
+                }
+            }
+
+            // Apply gain compensation.
+            left_sum *= gain;
+            right_sum *= gain;
 
             // Write to stereo output. AUDIO_IO_LAYOUTS guarantees exactly 2 channels.
             let mut channels = channel_samples.iter_mut();
             if let Some(left) = channels.next() {
-                *left = left_sample;
+                *left = left_sum;
             }
             if let Some(right) = channels.next() {
-                *right = right_sample;
+                *right = right_sum;
             }
         }
 
@@ -263,6 +316,15 @@ mod tests {
     /// Helper: construct a default plugin and call initialize().
     fn init_plugin(sample_rate: f32) -> SineOne {
         initialize_plugin(SineOne::default(), sample_rate)
+    }
+
+    /// Helper: construct a plugin with a custom voice count and call initialize().
+    fn init_plugin_with_voices(sample_rate: f32, voice_count: i32) -> SineOne {
+        let plugin = SineOne {
+            params: Arc::new(SineOneParams::with_voices(voice_count)),
+            ..SineOne::default()
+        };
+        initialize_plugin(plugin, sample_rate)
     }
 
     /// Helper: construct a plugin with a custom start_phase and call initialize().
@@ -850,6 +912,204 @@ mod tests {
             retrigger_left[0] > 0.7,
             "90° start phase should reset oscillator to peak on retrigger, got {}",
             retrigger_left[0]
+        );
+    }
+
+    // --- Polyphonic tests ---
+
+    #[test]
+    fn two_notes_produce_two_voices() {
+        let mut plugin = init_plugin_with_voices(44100.0, 4);
+
+        // Play two different notes simultaneously.
+        let events = vec![
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 60, // C4
+                velocity: 1.0,
+            },
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 64, // E4
+                velocity: 1.0,
+            },
+        ];
+        run_process(&mut plugin, 256, events);
+
+        // Two voices should be active.
+        let active = plugin.voices.iter().filter(|v| !v.is_idle()).count();
+        assert_eq!(active, 2, "two notes should activate two voices");
+    }
+
+    #[test]
+    fn voice_stealing_when_full() {
+        let mut plugin = init_plugin_with_voices(44100.0, 2);
+
+        // Fill both voice slots.
+        let events = vec![
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 60,
+                velocity: 1.0,
+            },
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 64,
+                velocity: 1.0,
+            },
+        ];
+        run_process(&mut plugin, 100, events);
+
+        // Third note should steal the oldest voice.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 67,
+            velocity: 1.0,
+        }];
+        run_process(&mut plugin, 100, events);
+
+        // Note 67 should be playing. The stolen voice (note 60, oldest) was
+        // replaced, so only notes 64 and 67 should be active.
+        let active_notes: Vec<u8> = plugin.voices.iter().filter_map(|v| v.note()).collect();
+        assert!(
+            active_notes.contains(&67),
+            "stolen voice should now play note 67, active: {active_notes:?}"
+        );
+        assert!(
+            !active_notes.contains(&60),
+            "oldest note (60) should have been stolen, active: {active_notes:?}"
+        );
+    }
+
+    #[test]
+    fn note_off_releases_correct_voice() {
+        let mut plugin = init_plugin_with_voices(44100.0, 4);
+
+        // Play two notes.
+        let events = vec![
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 60,
+                velocity: 1.0,
+            },
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 64,
+                velocity: 1.0,
+            },
+        ];
+        run_process(&mut plugin, 256, events);
+
+        // Release only note 60.
+        let events = vec![NoteEvent::NoteOff {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 60,
+            velocity: 0.0,
+        }];
+        run_process(&mut plugin, 64, events);
+
+        // Note 64 should still be playing (not releasing).
+        let still_holding: Vec<u8> = plugin.voices.iter().filter_map(|v| v.note()).collect();
+        assert!(
+            still_holding.contains(&64),
+            "note 64 should still be held, active: {still_holding:?}"
+        );
+        assert!(
+            !still_holding.contains(&60),
+            "note 60 should have been released, active: {still_holding:?}"
+        );
+    }
+
+    #[test]
+    fn gain_compensation_scales_output() {
+        // With voices=1 and voices=4, playing the same single note should
+        // produce output that is 4x quieter with voices=4 (gain = 1/4).
+        let mut plugin_1 = init_plugin_with_voices(44100.0, 1);
+        let mut plugin_4 = init_plugin_with_voices(44100.0, 4);
+
+        let events = || {
+            vec![NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            }]
+        };
+
+        let (left_1, _) = run_process(&mut plugin_1, 512, events());
+        let (left_4, _) = run_process(&mut plugin_4, 512, events());
+
+        // Compare RMS levels. voices=4 should be ~4x quieter.
+        let rms = |samples: &[f32]| -> f32 {
+            let sum: f32 = samples.iter().map(|s| s * s).sum();
+            (sum / samples.len() as f32).sqrt()
+        };
+        let rms_1 = rms(&left_1);
+        let rms_4 = rms(&left_4);
+        let ratio = rms_1 / rms_4;
+
+        assert!(
+            (ratio - 4.0).abs() < 0.5,
+            "gain compensation should make voices=4 about 4x quieter, ratio was {ratio}"
+        );
+    }
+
+    #[test]
+    fn polyphonic_output_is_sum_of_voices() {
+        let mut plugin = init_plugin_with_voices(44100.0, 4);
+
+        // Play two notes simultaneously. The output should be nonzero and
+        // differ from playing just one note.
+        let events = vec![
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 60,
+                velocity: 1.0,
+            },
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 67,
+                velocity: 1.0,
+            },
+        ];
+        let (left_two, _) = run_process(&mut plugin, 512, events);
+
+        // Compare with a fresh plugin playing just one note.
+        let mut plugin_one = init_plugin_with_voices(44100.0, 4);
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 60,
+            velocity: 1.0,
+        }];
+        let (left_one, _) = run_process(&mut plugin_one, 512, events);
+
+        // The two-note output should differ from the one-note output.
+        assert_ne!(
+            left_two, left_one,
+            "two simultaneous notes should produce different output than one"
         );
     }
 }
