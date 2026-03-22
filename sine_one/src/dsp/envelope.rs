@@ -106,6 +106,13 @@ impl ArEnvelope {
         }
     }
 
+    /// Returns `true` when the envelope is in the Idle state (silent).
+    /// Used by the plugin to distinguish "starting from silence" (phase reset
+    /// desired) from "retrigger while sounding" (phase reset causes click).
+    pub fn is_idle(&self) -> bool {
+        self.state == EnvState::Idle
+    }
+
     /// Zero all state. Called by `Plugin::reset()`.
     pub fn reset(&mut self) {
         self.state = EnvState::Idle;
@@ -326,5 +333,56 @@ mod tests {
                     "release phase: value {v} out of [0, 1]");
             }
         }
+    }
+
+    #[test]
+    fn is_idle_when_default() {
+        let env = ArEnvelope::default();
+        assert!(env.is_idle(), "fresh envelope should be idle");
+    }
+
+    #[test]
+    fn is_not_idle_during_attack() {
+        let mut env = make_envelope(10.0, 100.0);
+        env.note_on();
+        assert!(!env.is_idle(), "envelope should not be idle during attack");
+    }
+
+    #[test]
+    fn is_not_idle_during_release() {
+        let mut env = make_envelope(10.0, 100.0);
+        env.note_on();
+        // Complete attack.
+        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        for _ in 0..attack_samples + 10 {
+            env.next_sample();
+        }
+        env.note_off();
+        // Advance partway through release.
+        for _ in 0..500 {
+            env.next_sample();
+        }
+        assert!(!env.is_idle(), "envelope should not be idle during release");
+    }
+
+    #[test]
+    fn is_idle_after_release_completes() {
+        let mut env = make_envelope(10.0, 100.0);
+        env.note_on();
+        // Complete attack.
+        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        for _ in 0..attack_samples + 10 {
+            env.next_sample();
+        }
+        env.note_off();
+        // Complete release.
+        let release_samples = (100.0 * 44100.0 / 1000.0) as usize;
+        for _ in 0..release_samples + 10 {
+            env.next_sample();
+        }
+        assert!(
+            env.is_idle(),
+            "envelope should be idle after release completes"
+        );
     }
 }

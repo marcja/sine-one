@@ -90,11 +90,19 @@ State transition rules:
   `level ≤ 0` → `Idle`
 - **Idle**: outputs 0.0
 
-**Phase retrigger on NoteOn:** The oscillator phase is reset to a configurable start position
-(default 0° = sin(0) = 0.0) on every NoteOn. This ensures deterministic transients and eliminates
-clicks from random phase positions when the envelope attack begins. The `start_phase` parameter
-(0–360°) allows choosing the initial waveform position — 0° is the cleanest sine start, while
-90° starts at the peak for a more aggressive transient.
+**Phase retrigger on NoteOn:** Phase reset behavior depends on context:
+
+- **From silence** (envelope Idle): phase always resets to `start_phase`. The attack envelope
+  ramps from zero, so no click occurs at any start phase.
+- **Retrigger at 0° start phase**: phase continues from its current position. Since `sin(0) = 0`,
+  a hard reset would create a waveform dip to zero (audible click). Phase continuity avoids this,
+  giving a smooth retrigger. Velocity ramps over ~2ms via `LinearSmoother`.
+- **Retrigger at non-zero start phase**: phase resets to `start_phase`, creating an intentional
+  transient whose magnitude scales with `sin(start_phase)`. This is the desired "click" character
+  that `start_phase` controls — 0° = smooth, 90° = maximum punch. Velocity jumps immediately.
+
+The `start_phase` parameter (0–360°) thus serves double duty: it sets the initial waveform
+position for notes from silence, and controls the retrigger transient character during performance.
 
 ### Velocity Scaling
 
@@ -105,8 +113,10 @@ normalized to [0.0, 1.0] (not a raw `u8` 0–127). The output is scaled directly
 output = osc_sample * envelope_level * velocity
 ```
 
-This velocity value is stored on the plugin struct at note-on and applied per-sample in the
-process loop.
+Velocity is applied per-sample via a `LinearSmoother`. When starting from silence (envelope
+Idle), velocity jumps to the target immediately — the attack envelope already provides a smooth
+fade-in. On retrigger, velocity ramps linearly over ~2ms to avoid a gain discontinuity (click)
+when the new note has a different velocity than the previous one.
 
 ### Stereo Panning
 
@@ -199,9 +209,10 @@ sine-one/
         ├── plugin.rs       # SineOne struct + Plugin trait impl (process, initialize, reset)
         ├── params.rs       # SineOneParams struct with three FloatParams
         ├── dsp/
-        │   ├── mod.rs      # pub mod oscillator; pub mod envelope; pub mod pan;
+        │   ├── mod.rs      # pub mod oscillator; pub mod envelope; pub mod pan; pub mod smoother;
         │   ├── oscillator.rs   # SineOscillator: phase, set_frequency(), next_sample(), reset()
         │   ├── envelope.rs     # ArEnvelope: EnvState enum, ArEnvelope struct, all methods
+        │   ├── smoother.rs     # LinearSmoother: linear ramp for click-free parameter transitions
         │   └── pan.rs          # apply_constant_power_pan(): stereo panning via sin/cos pan law
         └── main.rs         # standalone binary: nih_export_standalone::<SineOne>()
 ```
@@ -523,9 +534,11 @@ Make it executable: `chmod +x .git/hooks/pre-commit`
    A quadratic or logarithmic curve (`velocity^2 / 127^2`) often feels more natural on keyboards.
    Leave linear for now; easy to change in one place later.
 
-3. **~~Phase initialization~~** *(resolved)*: The oscillator phase is now reset to a configurable
-   `start_phase` parameter (0–360°, default 0°) on every NoteOn. This ensures deterministic
-   transients and eliminates clicks from random phase positions.
+3. **~~Phase initialization~~** *(resolved)*: The oscillator phase is reset to the configurable
+   `start_phase` parameter (0–360°, default 0°) on NoteOn **only when starting from silence**
+   (envelope Idle). On retrigger, the phase continues from its current position to avoid a
+   waveform discontinuity (click). Velocity is also smoothed over ~2ms on retrigger via a
+   `LinearSmoother` to avoid gain discontinuities.
 
 4. **~~Mono vs. stereo output layout~~** *(resolved)*: The plugin now applies constant-power
    panning via `PolyPan` note expression events. At center pan (default), both channels carry

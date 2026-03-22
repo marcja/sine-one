@@ -5,6 +5,7 @@ use nih_plug::prelude::*;
 
 use crate::dsp::envelope::ArEnvelope;
 use crate::dsp::oscillator::SineOscillator;
+use crate::dsp::smoother::LinearSmoother;
 use crate::params::SineOneParams;
 
 /// A minimal monophonic sine-wave synthesizer CLAP plugin.
@@ -20,8 +21,10 @@ pub struct SineOne {
     envelope: ArEnvelope,
     /// Currently held MIDI note number, or `None` if no note is active.
     current_note: Option<u8>,
-    /// Velocity of the current note, normalized to [0.0, 1.0].
-    current_velocity: f32,
+    /// Smoothed velocity for the current note. On retrigger, ramps over ~2ms
+    /// to avoid a gain discontinuity. On first note from silence, jumps
+    /// immediately (the attack envelope handles the fade-in).
+    velocity_smoother: LinearSmoother,
     /// Cached base frequency (Hz) for the current note, before fine-tune.
     /// Stored to avoid recomputing `midi_note_to_freq` every sample.
     current_base_freq: f32,
@@ -38,7 +41,7 @@ impl Default for SineOne {
             oscillator: SineOscillator::default(),
             envelope: ArEnvelope::default(),
             current_note: None,
-            current_velocity: 0.0,
+            velocity_smoother: LinearSmoother::default(),
             current_base_freq: 0.0,
             current_pan: 0.0,
         }
@@ -95,7 +98,7 @@ impl Plugin for SineOne {
         self.oscillator.reset();
         self.envelope.reset();
         self.current_note = None;
-        self.current_velocity = 0.0;
+        self.velocity_smoother.reset();
         self.current_base_freq = 0.0;
         self.current_pan = 0.0;
     }
@@ -118,8 +121,6 @@ impl Plugin for SineOne {
                 match event {
                     NoteEvent::NoteOn { note, velocity, .. } => {
                         self.current_note = Some(note);
-                        // nih-plug normalizes velocity to [0.0, 1.0].
-                        self.current_velocity = velocity;
 
                         // Cache the base frequency for this note. The per-sample loop
                         // applies fine-tune on top of this each sample, so we avoid
@@ -127,9 +128,34 @@ impl Plugin for SineOne {
                         self.current_base_freq = util::midi_note_to_freq(note);
 
                         // Convert start_phase from degrees (0–360) to normalized [0, 1).
-                        // The % 1.0 maps 360° to 0.0 (same position).
                         let start_phase_normalized = self.params.start_phase.value() / 360.0 % 1.0;
-                        self.oscillator.set_phase(start_phase_normalized);
+
+                        // Phase reset and velocity strategy depend on context:
+                        //
+                        // - From silence (idle): always reset phase and jump velocity.
+                        //   The attack envelope handles the fade-in.
+                        //
+                        // - Retrigger at 0° start phase: skip phase reset (sin(0) = 0
+                        //   would create a waveform dip to zero → click). Phase continues
+                        //   from current position. Velocity ramps over ~2ms.
+                        //
+                        // - Retrigger at non-zero start phase: reset phase to create an
+                        //   intentional transient whose magnitude scales with
+                        //   sin(start_phase). This is the desired "click" character
+                        //   that start_phase controls. Velocity jumps immediately.
+                        let smooth_retrigger =
+                            !self.envelope.is_idle() && start_phase_normalized == 0.0;
+
+                        if smooth_retrigger {
+                            // 0° retrigger: phase continues, velocity ramps.
+                            let ramp_samples = (0.002 * self.sample_rate) as u32;
+                            self.velocity_smoother.set_target(velocity, ramp_samples);
+                        } else {
+                            // From silence or non-zero start phase: reset phase
+                            // and jump velocity.
+                            self.oscillator.set_phase(start_phase_normalized);
+                            self.velocity_smoother.set_immediate(velocity);
+                        }
 
                         // Read attack time from params and trigger the envelope.
                         self.envelope
@@ -175,10 +201,11 @@ impl Plugin for SineOne {
                 self.oscillator.set_frequency(freq, self.sample_rate);
             }
 
-            // Generate audio: oscillator × envelope × velocity.
+            // Generate audio: oscillator × envelope × smoothed velocity.
             let osc_sample = self.oscillator.next_sample();
             let env_sample = self.envelope.next_sample();
-            let mono_output = osc_sample * env_sample * self.current_velocity;
+            let velocity = self.velocity_smoother.next_sample();
+            let mono_output = osc_sample * env_sample * velocity;
 
             // Apply constant-power stereo panning.
             let (left_sample, right_sample) =
@@ -395,7 +422,7 @@ mod tests {
 
         // Simulate a note being active.
         plugin.current_note = Some(69);
-        plugin.current_velocity = 100.0 / 127.0;
+        plugin.velocity_smoother.set_immediate(100.0 / 127.0);
         plugin.current_base_freq = 440.0;
 
         plugin.reset();
@@ -405,8 +432,9 @@ mod tests {
             "current_note should be None after reset"
         );
         assert_eq!(
-            plugin.current_velocity, 0.0,
-            "current_velocity should be 0.0 after reset"
+            plugin.velocity_smoother.next_sample(),
+            0.0,
+            "velocity smoother should output 0.0 after reset"
         );
         assert_eq!(
             plugin.current_base_freq, 0.0,
@@ -741,10 +769,10 @@ mod tests {
     }
 
     #[test]
-    fn retrigger_resets_phase() {
+    fn retrigger_continues_phase() {
         let mut plugin = init_plugin(44100.0);
 
-        // First NoteOn.
+        // First NoteOn — let oscillator run for 200 samples.
         let events = vec![NoteEvent::NoteOn {
             timing: 0,
             voice_id: None,
@@ -752,9 +780,13 @@ mod tests {
             note: 69,
             velocity: 1.0,
         }];
-        run_process(&mut plugin, 200, events);
+        let (pre_left, _) = run_process(&mut plugin, 200, events);
 
-        // Second NoteOn (retrigger, no NoteOff).
+        // Capture last sample before retrigger.
+        let last_before = pre_left[199];
+
+        // Second NoteOn (retrigger, no NoteOff). Phase should continue,
+        // not reset — avoiding a waveform discontinuity (click).
         let events = vec![NoteEvent::NoteOn {
             timing: 0,
             voice_id: None,
@@ -764,12 +796,127 @@ mod tests {
         }];
         let (retrigger_left, _) = run_process(&mut plugin, 32, events);
 
-        // Phase resets to 0 on retrigger. sin(0) = 0, so the first sample's
-        // oscillator contribution is zero regardless of envelope level.
-        // output[0] = sin(0) * envelope * velocity = 0.
+        // The transition should be smooth: the difference between the last
+        // sample before retrigger and the first sample after should be
+        // bounded by the maximum single-sample delta of a 440 Hz sine at
+        // 44100 Hz (≈ 2π * 440 / 44100 ≈ 0.063), plus some envelope margin.
+        let delta = (retrigger_left[0] - last_before).abs();
         assert!(
-            retrigger_left[0].abs() < 1e-6,
-            "first sample after retrigger should be ~0 (sin(0) = 0), got {}",
+            delta < 0.15,
+            "retrigger should be smooth (phase continues), but delta was {delta}"
+        );
+    }
+
+    #[test]
+    fn retrigger_from_idle_resets_phase() {
+        let mut plugin = init_plugin(44100.0);
+
+        // First NoteOn: capture first 64 samples.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        let (first_left, _) = run_process(&mut plugin, 64, events);
+
+        // Advance, NoteOff, and wait for full release (envelope → Idle).
+        run_process(&mut plugin, 200, vec![]);
+        let events = vec![NoteEvent::NoteOff {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 0.0,
+        }];
+        run_process(&mut plugin, 20000, events);
+
+        // Second NoteOn from idle: phase should be reset, producing
+        // identical output to the first NoteOn.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        let (second_left, _) = run_process(&mut plugin, 64, events);
+
+        assert_eq!(
+            first_left, second_left,
+            "NoteOn from idle should reset phase and produce identical output"
+        );
+    }
+
+    #[test]
+    fn retrigger_velocity_change_is_smooth() {
+        let mut plugin = init_plugin(44100.0);
+
+        // NoteOn at full velocity, process enough for attack to complete.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        let (pre_left, _) = run_process(&mut plugin, 500, events);
+        let last_before = pre_left[499];
+
+        // Retrigger at very low velocity — big gain change.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 0.2,
+        }];
+        let (retrigger_left, _) = run_process(&mut plugin, 256, events);
+
+        // The first sample after retrigger should not jump by more than
+        // the natural oscillator delta + a small margin. Without smoothing,
+        // the gain would drop by 0.8× instantly.
+        let delta = (retrigger_left[0] - last_before).abs();
+        assert!(
+            delta < 0.15,
+            "velocity change should be smooth, but first-sample delta was {delta}"
+        );
+    }
+
+    #[test]
+    fn retrigger_with_nonzero_start_phase_resets_phase() {
+        let mut plugin = init_plugin_with_start_phase(44100.0, 90.0);
+
+        // First NoteOn: process enough for attack to complete.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        run_process(&mut plugin, 500, events);
+
+        // Second NoteOn (retrigger). At 90° start phase, the oscillator
+        // should reset to phase 0.25 (sin(π/2) = 1.0), creating an
+        // intentional transient.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        let (retrigger_left, _) = run_process(&mut plugin, 32, events);
+
+        // At 90° start phase, the first sample should be near the peak
+        // of the sine wave (sin(0.25 * 2π) = 1.0) × envelope level × velocity.
+        // The envelope is near 1.0 after 500 samples of attack (10ms = 441 samples).
+        // So the first sample should be close to 1.0.
+        assert!(
+            retrigger_left[0] > 0.7,
+            "90° start phase should reset oscillator to peak on retrigger, got {}",
             retrigger_left[0]
         );
     }
