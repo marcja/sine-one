@@ -188,11 +188,10 @@ sine-one/
 ├── Cargo.toml              # workspace manifest
 ├── Cargo.lock
 ├── bundler.toml            # [sine_one] name = "SineOne" — lives at workspace root
-├── deploy.sh               # build + validate + install (see Build & Test Plan)
 ├── xtask/
 │   ├── Cargo.toml          # [dependencies] nih_plug_xtask = { git = "..." }
 │   └── src/
-│       └── main.rs         # fn main() { nih_plug_xtask::main() }
+│       └── main.rs         # "deploy" subcommand + nih_plug_xtask delegation
 └── sine_one/
     ├── Cargo.toml          # plugin crate (see Cargo.toml section below)
     └── src/
@@ -452,26 +451,21 @@ cargo test
 cargo xtask bundle sine_one --release
 ```
 
-### Deploy Script (`deploy.sh`)
+### Deploy (`cargo xtask deploy`)
+
+Builds, validates, and installs in one step:
 
 ```bash
-#!/bin/bash
-set -e
-PLUGIN_NAME="sine_one"
-BUNDLE="target/bundled/SineOne.clap"
-CLAP_DIR="$HOME/Library/Audio/Plug-Ins/CLAP"
-
-# Build
-cargo xtask bundle "$PLUGIN_NAME" --release
-
-# Validate CLAP compliance (fail fast)
-clap-validator validate "$BUNDLE" --only-failed
-
-# Install
-cp -r "$BUNDLE" "$CLAP_DIR/"
-echo "Installed to $CLAP_DIR/SineOne.clap"
-echo "→ Rescan plugins in Bitwig: Preferences > Plug-ins > Rescan"
+cargo xtask deploy
 ```
+
+This runs:
+1. `cargo xtask bundle sine_one --release` — build the CLAP bundle
+2. `clap-validator validate target/bundled/SineOne.clap --only-failed` — validate compliance
+3. Copy bundle to `~/Library/Audio/Plug-Ins/CLAP/`
+
+The deploy subcommand is implemented in `xtask/src/main.rs`. All other xtask
+subcommands (e.g., `bundle`) are delegated to `nih_plug_xtask::main()`.
 
 ### Gatekeeper (first install only)
 

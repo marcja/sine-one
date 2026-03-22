@@ -76,7 +76,7 @@ Next: One sentence. What is the logical next commit after this one?
 | `params` | `src/params.rs` |
 | `plugin` | `src/plugin.rs` (Plugin trait impl) |
 | `lib` | `src/lib.rs` (exports, top-level wiring) |
-| `build` | `Cargo.toml`, `xtask/`, `bundler.toml`, `deploy.sh` |
+| `build` | `Cargo.toml`, `xtask/`, `bundler.toml` |
 | `tests` | `tests/` integration test files |
 | `bench` | `benches/` |
 | `docs` | `README.md`, `docs/`, `CLAUDE.md` |
@@ -131,7 +131,7 @@ Prefer commits that are **one thing**. Use these as guides:
 - One DSP struct per commit (`SineOscillator` is one commit, `ArEnvelope` is another)
 - One layer per commit (DSP and Plugin trait wiring should not be in the same commit)
 - Tests for a struct ship **in the same commit** as the struct — never ahead, never behind
-- Build/config changes (Cargo.toml, bundler.toml, deploy.sh) are their own commit
+- Build/config changes (Cargo.toml, bundler.toml, xtask/) are their own commit
 - `CLAUDE.md` changes are always their own separate commit with scope `[docs]`
 
 **Do not batch.** A commit that says "add oscillator, envelope, and params" makes the git log
@@ -230,7 +230,7 @@ Follow this sequence. Each step is a candidate commit boundary.
 6. [plugin]  initialize() and reset() — wire sample rate into DSP structs
 7. [plugin]  process() — NoteOn/NoteOff event handling + per-sample output
 8. [tests]   Lifecycle integration tests (silence before NoteOn, note_on_produces_output)
-9. [build]   deploy.sh + standalone binary feature
+9. [build]   cargo xtask deploy + standalone binary feature
 10. [bench]  criterion benchmark for process() block
 11. [docs]   README and design.md updates reflecting any implementation deltas
 ```
