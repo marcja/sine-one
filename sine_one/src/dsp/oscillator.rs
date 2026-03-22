@@ -55,8 +55,8 @@ impl SineOscillator {
 ///
 /// Formula: `base_freq * 2^(cents / 1200)`.
 /// 1200 cents = one octave (frequency doubles).
-/// NOTE: uses `powf` which is expensive — call per-note or per-parameter-change,
-/// not per-sample.
+/// NOTE: uses `powf` which is expensive. Called per-sample in process() to
+/// support real-time pitch modulation; acceptable cost for a monophonic synth.
 pub fn apply_detune(base_freq: f32, cents: f32) -> f32 {
     // Pitch interval in cents: 1200 cents = 1 octave = frequency × 2.
     // So the multiplier is 2^(cents / 1200).
