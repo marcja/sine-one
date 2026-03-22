@@ -930,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn retrigger_with_nonzero_start_phase_resets_phase() {
+    fn retrigger_with_nonzero_start_phase_is_smooth() {
         let mut plugin = init_plugin_with_start_phase(44100.0, 90.0);
 
         // First NoteOn: process enough for attack to complete.
@@ -941,11 +941,12 @@ mod tests {
             note: 69,
             velocity: 1.0,
         }];
-        run_process(&mut plugin, 500, events);
+        let (pre_left, _) = run_process(&mut plugin, 500, events);
+        let last_before = pre_left[499];
 
-        // Second NoteOn (retrigger). At 90° start phase, the oscillator
-        // should reset to phase 0.25 (sin(π/2) = 1.0), creating an
-        // intentional transient.
+        // Second NoteOn (retrigger). Even at 90° start phase, retrigger
+        // should continue the oscillator phase (no reset) to prevent
+        // uncontrolled clicks while the envelope is at a non-zero level.
         let events = vec![NoteEvent::NoteOn {
             timing: 0,
             voice_id: None,
@@ -955,14 +956,12 @@ mod tests {
         }];
         let (retrigger_left, _) = run_process(&mut plugin, 32, events);
 
-        // At 90° start phase, the first sample should be near the peak
-        // of the sine wave (sin(0.25 * 2π) = 1.0) × envelope level × velocity.
-        // The envelope is near 1.0 after 500 samples of attack (10ms = 441 samples).
-        // So the first sample should be close to 1.0.
+        // The first sample after retrigger should be continuous with the
+        // waveform before retrigger (no sudden jump to sin(90°) = 1.0).
+        let diff = (retrigger_left[0] - last_before).abs();
         assert!(
-            retrigger_left[0] > 0.7,
-            "90° start phase should reset oscillator to peak on retrigger, got {}",
-            retrigger_left[0]
+            diff < 0.1,
+            "retrigger should be smooth (phase continues), but jump was {diff}"
         );
     }
 

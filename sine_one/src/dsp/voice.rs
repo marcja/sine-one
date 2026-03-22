@@ -141,18 +141,20 @@ impl Voice {
     ///   transient (click) that the start_phase parameter controls.
     /// - **From silence at 0° or with long attack**: reset phase, jump velocity,
     ///   normal envelope ramp from zero.
-    /// - **Retrigger at 0° start phase**: skip phase reset (continuing phase avoids
-    ///   a waveform dip to zero → click). Velocity ramps over ~2ms.
-    /// - **Retrigger at non-zero start phase**: reset phase to create an intentional
-    ///   transient. Velocity jumps immediately.
+    /// - **Retrigger** (envelope not idle): phase always continues from its current
+    ///   position and velocity ramps over ~2ms. This prevents uncontrolled clicks
+    ///   from waveform discontinuities while the envelope is at a non-zero level.
     pub fn note_on(&mut self, params: NoteOnParams) {
         let was_idle = self.env.is_idle();
         self.note = Some(params.note);
         self.base_freq = params.base_freq;
         self.age = params.age;
 
-        // Determine retrigger strategy based on current envelope state and start phase.
-        let smooth_retrigger = !was_idle && params.start_phase_normalized == 0.0;
+        // Retrigger always continues phase to avoid uncontrolled waveform discontinuity
+        // clicks while the envelope is at a non-zero level. Start phase transient only
+        // applies when starting from silence (was_idle), where the envelope initial level
+        // is controlled by the attack-gated mechanism below.
+        let smooth_retrigger = !was_idle;
 
         if smooth_retrigger {
             // 0° retrigger: phase continues, velocity ramps over ~2ms.
@@ -160,7 +162,7 @@ impl Voice {
             self.velocity_smoother
                 .set_target(params.velocity, ramp_samples);
         } else {
-            // From silence or non-zero start phase: reset phase and jump velocity.
+            // From silence: reset phase to start_phase and jump velocity.
             self.osc.set_phase(params.start_phase_normalized);
             self.velocity_smoother.set_immediate(params.velocity);
         }
@@ -445,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_retrigger_resets_phase_at_nonzero_start() {
+    fn voice_retrigger_is_smooth_at_nonzero_start() {
         let mut voice = Voice::default();
         trigger_voice(&mut voice, A4_NOTE, 0.5, 0.0);
 
@@ -455,7 +457,8 @@ mod tests {
         }
         assert!(!voice.is_idle());
 
-        // Retrigger at 90° (0.25 normalized) — should reset phase and jump velocity.
+        // Retrigger at 90° (0.25 normalized) — should still smooth retrigger
+        // (phase continues, velocity ramps) to avoid uncontrolled clicks.
         voice.note_on(NoteOnParams {
             note: A4_NOTE,
             velocity: 1.0,
@@ -466,11 +469,11 @@ mod tests {
             age: 2,
         });
 
-        // Velocity should jump immediately to 1.0.
+        // Velocity should ramp (not jump) — first sample should not be at target.
         let vel = voice.velocity_smoother.next_sample();
         assert!(
-            (vel - 1.0).abs() < 1e-6,
-            "velocity should jump on non-zero start phase retrigger, got {vel}"
+            (vel - 1.0).abs() > 0.001,
+            "velocity should ramp on retrigger even with non-zero start phase, got {vel}"
         );
     }
 

@@ -108,16 +108,15 @@ State transition rules:
   0.0 (smooth, `sin(0) = 0`). At 90° with a 1 ms attack, the initial level is 1.0 (maximum
   transient — first sample at full amplitude). Long attacks (≥ 10 ms) suppress the transient
   entirely, preserving the intended swell. The attack then ramps from the initial level to 1.0.
-- **Retrigger at 0° start phase**: phase continues from its current position. Since `sin(0) = 0`,
-  a hard reset would create a waveform dip to zero (audible click). Phase continuity avoids this,
-  giving a smooth retrigger. Velocity ramps over ~2ms via `LinearSmoother`.
-- **Retrigger at non-zero start phase**: phase resets to `start_phase`, creating an intentional
-  transient whose magnitude scales with `sin(start_phase)`. This is the desired "click" character
-  that `start_phase` controls — 0° = smooth, 90° = maximum punch. Velocity jumps immediately.
+- **Retrigger** (envelope not idle): phase always continues from its current position regardless
+  of start phase. Velocity ramps over ~2ms via `LinearSmoother`. This prevents uncontrolled
+  clicks from waveform discontinuities while the envelope is at a non-zero level. In mono mode
+  (voices=1), nearly every note is a retrigger since the previous voice is still releasing.
 
-The `start_phase` parameter (0–360°) thus serves double duty: it controls the initial waveform
-position and transient character for notes from silence, and the retrigger transient during
-performance.
+The `start_phase` parameter (0–360°) controls the initial waveform position and transient
+character for notes starting from silence. In polyphonic mode, each voice that starts from idle
+gets the start phase transient. In monophonic mode, only the first note (or notes after a full
+release) produces the transient.
 
 ### Velocity Scaling
 
