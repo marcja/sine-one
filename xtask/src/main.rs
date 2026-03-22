@@ -19,6 +19,7 @@ fn main() -> nih_plug_xtask::Result<()> {
 ///   2. clap-validator validate target/bundled/SineOne.clap --only-failed
 ///   3. cp -r bundle → ~/Library/Audio/Plug-Ins/CLAP/
 fn deploy() {
+    // NOTE: macOS-specific CLAP plugin path. Linux would use ~/.clap.
     let clap_dir = format!(
         "{}/Library/Audio/Plug-Ins/CLAP",
         std::env::var("HOME").expect("HOME not set")

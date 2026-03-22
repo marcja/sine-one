@@ -171,11 +171,11 @@ impl Plugin for SineOne {
                         });
                     }
                     NoteEvent::NoteOff { note, .. } => {
-                        // NOTE(note_off_scan): Scan all MAX_VOICES slots, not just
-                        //   [..voice_count]. Voices beyond voice_count may still be
-                        //   releasing (after the user decreased the voice count) and
-                        //   need NoteOff handling to reach Idle.
-                        let target = self.voices[..MAX_VOICES]
+                        // NOTE(note_off_scan): Scan all voice slots, not just
+                        //   [..voice_count]. Voices beyond voice_count may still
+                        //   be releasing and need NoteOff to reach Idle.
+                        let target = self
+                            .voices
                             .iter()
                             .enumerate()
                             .filter(|(_, v)| v.note() == Some(note))
@@ -199,9 +199,8 @@ impl Plugin for SineOne {
                             self.voices[0].set_pan(pan);
                         } else {
                             // Route to the voice playing this note.
-                            if let Some(voice) = self.voices[..MAX_VOICES]
-                                .iter_mut()
-                                .find(|v| v.note() == Some(note))
+                            if let Some(voice) =
+                                self.voices.iter_mut().find(|v| v.note() == Some(note))
                             {
                                 voice.set_pan(pan);
                             }
@@ -251,7 +250,7 @@ impl Plugin for SineOne {
 
 impl ClapPlugin for SineOne {
     const CLAP_ID: &'static str = "com.sine-one.sine-one";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("Minimal monophonic sine-wave synthesizer");
+    const CLAP_DESCRIPTION: Option<&'static str> = Some("Minimal polyphonic sine-wave synthesizer");
     const CLAP_MANUAL_URL: Option<&'static str> = None;
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[

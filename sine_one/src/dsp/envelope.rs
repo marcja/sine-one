@@ -3,7 +3,7 @@
 /// State machine:
 ///   note_on() → Attack → (level reaches 1.0, holds) → note_off() → Release → (level reaches 0) → Idle
 ///   note_on() from any state → enters Attack from current level (no reset to 0.0)
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EnvState {
     /// Silent — outputs 0.0 continuously.
     #[default]
@@ -136,6 +136,8 @@ impl ArEnvelope {
     pub fn reset(&mut self) {
         self.state = EnvState::Idle;
         self.level = 0.0;
+        self.attack_increment = 0.0;
+        self.release_decrement = 0.0;
     }
 }
 
@@ -144,11 +146,19 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Helper: create an envelope with given attack/release in ms at 44100 Hz.
+    /// Default sample rate used by all test helpers.
+    const TEST_SAMPLE_RATE: f32 = 44100.0;
+
+    /// Convert a duration in milliseconds to a whole number of samples.
+    fn ms_to_samples(ms: f32) -> usize {
+        (ms * TEST_SAMPLE_RATE / 1000.0) as usize
+    }
+
+    /// Helper: create an envelope with given attack/release in ms at the test sample rate.
     fn make_envelope(attack_ms: f32, release_ms: f32) -> ArEnvelope {
         let mut env = ArEnvelope::default();
-        env.set_attack(attack_ms, 44100.0);
-        env.set_release(release_ms, 44100.0);
+        env.set_attack(attack_ms, TEST_SAMPLE_RATE);
+        env.set_release(release_ms, TEST_SAMPLE_RATE);
         env
     }
 
@@ -185,7 +195,7 @@ mod tests {
         env.note_on();
 
         // 10ms at 44100 Hz = 441 samples. Run a few extra to be safe.
-        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        let attack_samples = ms_to_samples(10.0);
         for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
@@ -203,7 +213,7 @@ mod tests {
         env.note_on();
 
         // Complete the attack phase.
-        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        let attack_samples = ms_to_samples(10.0);
         for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
@@ -224,7 +234,7 @@ mod tests {
         env.note_on();
 
         // Complete attack.
-        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        let attack_samples = ms_to_samples(10.0);
         for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
@@ -250,7 +260,7 @@ mod tests {
         env.note_on();
 
         // Complete attack.
-        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        let attack_samples = ms_to_samples(10.0);
         for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
@@ -258,7 +268,7 @@ mod tests {
         env.note_off();
 
         // Release at 100ms = 4410 samples. Run extra to ensure idle.
-        let release_samples = (100.0 * 44100.0 / 1000.0) as usize;
+        let release_samples = ms_to_samples(100.0);
         for _ in 0..release_samples + 10 {
             env.next_sample();
         }
@@ -300,7 +310,7 @@ mod tests {
         env.note_on();
 
         // Complete attack phase.
-        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        let attack_samples = ms_to_samples(10.0);
         for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
@@ -335,18 +345,17 @@ mod tests {
     proptest! {
         #[test]
         fn envelope_output_bounded(attack_ms in 1.0f32..5000.0, release_ms in 1.0f32..10000.0) {
-            let sr = 44100.0;
             let mut env = ArEnvelope::default();
-            env.set_attack(attack_ms, sr);
-            env.set_release(release_ms, sr);
+            env.set_attack(attack_ms, TEST_SAMPLE_RATE);
+            env.set_release(release_ms, TEST_SAMPLE_RATE);
             env.note_on();
-            for _ in 0..(attack_ms * sr / 1000.0) as usize + 10 {
+            for _ in 0..ms_to_samples(attack_ms) + 10 {
                 let v = env.next_sample();
                 prop_assert!(v.is_finite() && v >= 0.0 && v <= 1.0,
                     "attack phase: value {v} out of [0, 1]");
             }
             env.note_off();
-            for _ in 0..(release_ms * sr / 1000.0) as usize + 10 {
+            for _ in 0..ms_to_samples(release_ms) + 10 {
                 let v = env.next_sample();
                 prop_assert!(v.is_finite() && v >= 0.0 && v <= 1.0,
                     "release phase: value {v} out of [0, 1]");
@@ -372,7 +381,7 @@ mod tests {
         let mut env = make_envelope(10.0, 100.0);
         env.note_on();
         // Complete attack.
-        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        let attack_samples = ms_to_samples(10.0);
         for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
@@ -389,7 +398,7 @@ mod tests {
         let mut env = make_envelope(10.0, 100.0);
         env.note_on();
         // Complete attack.
-        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        let attack_samples = ms_to_samples(10.0);
         for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
@@ -430,8 +439,7 @@ mod tests {
         // of it (fixed increment).
         let attack_ms = 10.0;
         let release_ms = 100.0;
-        let sr = 44100.0;
-        let attack_samples = (attack_ms * sr / 1000.0) as usize; // 441
+        let attack_samples = ms_to_samples(attack_ms); // 441
 
         let mut env = make_envelope(attack_ms, release_ms);
         env.note_on();
@@ -443,7 +451,7 @@ mod tests {
 
         // Release partway — level drops to ~0.5.
         env.note_off();
-        let half_release = (release_ms * sr / 1000.0) as usize / 2;
+        let half_release = ms_to_samples(release_ms) / 2;
         for _ in 0..half_release {
             env.next_sample();
         }
@@ -454,7 +462,7 @@ mod tests {
         );
 
         // Retrigger — attack should take full attack_samples to reach 1.0.
-        env.set_attack(attack_ms, sr);
+        env.set_attack(attack_ms, TEST_SAMPLE_RATE);
         env.note_on();
 
         // After 75% of the attack time, level should NOT yet be 1.0.
@@ -488,19 +496,44 @@ mod tests {
         let mut env = make_envelope(10.0, 100.0);
         env.note_on();
         // Complete attack.
-        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        let attack_samples = ms_to_samples(10.0);
         for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
         env.note_off();
         // Complete release.
-        let release_samples = (100.0 * 44100.0 / 1000.0) as usize;
+        let release_samples = ms_to_samples(100.0);
         for _ in 0..release_samples + 10 {
             env.next_sample();
         }
         assert!(
             env.is_idle(),
             "envelope should be idle after release completes"
+        );
+    }
+
+    #[test]
+    fn reset_clears_derived_increments() {
+        let mut env = make_envelope(10.0, 100.0);
+        env.note_on();
+        // Advance partway so attack_increment is non-zero.
+        for _ in 0..200 {
+            env.next_sample();
+        }
+        env.note_off();
+        // release_decrement is now non-zero.
+
+        env.reset();
+
+        // After reset, derived increments should be zero so that a note_on()
+        // without a preceding set_attack() produces no ramp (stays at 0.0).
+        assert_eq!(
+            env.attack_increment, 0.0,
+            "attack_increment should be zero after reset"
+        );
+        assert_eq!(
+            env.release_decrement, 0.0,
+            "release_decrement should be zero after reset"
         );
     }
 }

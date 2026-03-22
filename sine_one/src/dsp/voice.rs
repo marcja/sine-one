@@ -6,6 +6,7 @@ use super::smoother::LinearSmoother;
 /// Pre-computed constant-power pan gains. Caches the sin/cos results from
 /// `apply_constant_power_pan` so the trig is computed once per PolyPan event
 /// instead of once per sample.
+#[derive(Clone, Copy)]
 struct PanGains {
     left: f32,
     right: f32,
@@ -22,8 +23,14 @@ impl Default for PanGains {
 /// Maximum number of simultaneous voices the plugin supports.
 pub const MAX_VOICES: usize = 8;
 
+/// Duration of the velocity crossfade ramp on smooth retrigger (seconds).
+/// Short enough to be imperceptible, long enough to avoid a gain click
+/// when retriggering with a different velocity.
+const VELOCITY_RAMP_SECS: f32 = 0.002;
+
 /// Parameters for triggering a note on a voice. Bundles the values needed
 /// by `Voice::note_on()` to avoid excessive function arguments.
+#[derive(Clone, Copy)]
 pub struct NoteOnParams {
     pub note: u8,
     pub velocity: f32,
@@ -132,7 +139,7 @@ impl Voice {
 
         if smooth_retrigger {
             // 0° retrigger: phase continues, velocity ramps over ~2ms.
-            let ramp_samples = (0.002 * params.sample_rate) as u32;
+            let ramp_samples = (VELOCITY_RAMP_SECS * params.sample_rate) as u32;
             self.velocity_smoother
                 .set_target(params.velocity, ramp_samples);
         } else {
@@ -208,10 +215,11 @@ impl Voice {
 /// `voice_count` limits the search to `voices[0..voice_count]`, allowing the
 /// plugin to dynamically reduce polyphony without resizing the array.
 ///
-/// # Panics
-/// Panics if `voice_count` is 0 or exceeds `voices.len()`.
+/// # Preconditions
+/// `voice_count` must be in `1..=voices.len()`. Validated by `debug_assert!`;
+/// the caller in `process()` guarantees this via `.clamp(1, MAX_VOICES)`.
 pub fn allocate_voice(voices: &[Voice], voice_count: usize) -> usize {
-    assert!(voice_count > 0 && voice_count <= voices.len());
+    debug_assert!(voice_count > 0 && voice_count <= voices.len());
 
     // 1. First idle voice — no stealing needed.
     for (i, voice) in voices[..voice_count].iter().enumerate() {

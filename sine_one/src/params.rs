@@ -97,7 +97,7 @@ impl Default for SineOneParams {
 
             start_phase: Self::build_start_phase(0.0),
 
-            voices: IntParam::new("Voices", 1, IntRange::Linear { min: 1, max: 8 }),
+            voices: Self::build_voices(1),
 
             output_gain: Self::build_output_gain(0.0),
         }
@@ -105,6 +105,13 @@ impl Default for SineOneParams {
 }
 
 impl SineOneParams {
+    /// Build the voices IntParam with the given default value.
+    /// Shared between `Default` and the test helper to avoid duplicating
+    /// range definition.
+    fn build_voices(default_count: i32) -> IntParam {
+        IntParam::new("Voices", default_count, IntRange::Linear { min: 1, max: 8 })
+    }
+
     /// Build the output_gain FloatParam with the given default value.
     /// Shared between `Default` and the test helper to avoid duplicating
     /// range, unit, and step_size definitions.
@@ -152,7 +159,7 @@ impl SineOneParams {
     /// Create params with a custom voice count for testing.
     pub fn with_voices(voice_count: i32) -> Self {
         let mut params = Self::default();
-        params.voices = IntParam::new("Voices", voice_count, IntRange::Linear { min: 1, max: 8 });
+        params.voices = Self::build_voices(voice_count);
         params
     }
 

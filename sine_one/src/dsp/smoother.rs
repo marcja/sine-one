@@ -4,7 +4,7 @@
 ///
 /// On the final sample of a ramp, the value snaps exactly to the target
 /// to eliminate floating-point drift from repeated addition.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct LinearSmoother {
     current: f32,
     target: f32,

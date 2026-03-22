@@ -58,6 +58,7 @@ impl SineOscillator {
     /// oscillator to a known state.
     pub fn reset(&mut self) {
         self.phase = 0.0;
+        self.phase_increment = 0.0;
     }
 }
 
@@ -66,11 +67,12 @@ impl SineOscillator {
 /// Formula: `base_freq * 2^(cents / 1200)`.
 /// 1200 cents = one octave (frequency doubles).
 /// NOTE: uses `powf` which is expensive. Called per-sample in process() to
-/// support real-time pitch modulation; acceptable cost for a monophonic synth.
+/// support real-time pitch modulation; acceptable cost for up to 8 voices.
 pub fn apply_detune(base_freq: f32, cents: f32) -> f32 {
-    // Pitch interval in cents: 1200 cents = 1 octave = frequency × 2.
-    // So the multiplier is 2^(cents / 1200).
-    base_freq * 2.0_f32.powf(cents / 1200.0)
+    // One octave = 1200 cents = frequency × 2.
+    // So the multiplier is 2^(cents / CENTS_PER_OCTAVE).
+    const CENTS_PER_OCTAVE: f32 = 1200.0;
+    base_freq * 2.0_f32.powf(cents / CENTS_PER_OCTAVE)
 }
 
 #[cfg(test)]
@@ -225,6 +227,20 @@ mod tests {
             let sample = osc.next_sample();
             prop_assert!(sample.is_finite());
             prop_assert!((-1.0..=1.0).contains(&sample));
+        }
+    }
+
+    #[test]
+    fn reset_clears_phase_increment() {
+        let mut osc = SineOscillator::default();
+        osc.set_frequency(440.0, 44100.0);
+
+        osc.reset();
+
+        // With phase_increment cleared, phase stays at 0 and every sample is sin(0) = 0.0.
+        // If phase_increment was not cleared, the oscillator would advance its phase.
+        for _ in 0..10 {
+            assert_eq!(osc.next_sample(), 0.0);
         }
     }
 }
