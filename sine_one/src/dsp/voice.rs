@@ -15,6 +15,15 @@ pub const MAX_VOICES: usize = 8;
 /// when retriggering with a different velocity.
 const VELOCITY_RAMP_SECS: f32 = 0.002;
 
+/// Attack times shorter than this (in ms) allow the start-phase transient
+/// through. At this threshold the gate closes fully and the transient is
+/// suppressed, preserving the slow-attack swell the user intended.
+const TRANSIENT_GATE_MS: f32 = 10.0;
+
+/// Minimum attack time (ms) from the parameter range. At this value the
+/// transient gate is fully open (gate factor = 1.0).
+const MIN_ATTACK_MS: f32 = 1.0;
+
 /// Duration of the pan gain crossfade ramp (seconds). Prevents clicks when
 /// PolyPan events change pan while the voice is producing audio (common in
 /// mono mode with per-note pan randomization).
@@ -125,20 +134,25 @@ impl Voice {
 
     /// Trigger a note on this voice.
     ///
-    /// Handles the phase reset and velocity smoothing strategy:
-    /// - **From silence** (envelope idle): reset phase to `start_phase_normalized`,
-    ///   jump velocity immediately. The attack envelope provides the fade-in.
+    /// Handles the phase reset, velocity smoothing, and transient strategy:
+    /// - **From silence with non-zero start phase and short attack** (< 10 ms):
+    ///   reset phase, jump velocity, and set an initial envelope level proportional
+    ///   to `|sin(start_phase)|` gated by attack time. This creates the intentional
+    ///   transient (click) that the start_phase parameter controls.
+    /// - **From silence at 0° or with long attack**: reset phase, jump velocity,
+    ///   normal envelope ramp from zero.
     /// - **Retrigger at 0° start phase**: skip phase reset (continuing phase avoids
     ///   a waveform dip to zero → click). Velocity ramps over ~2ms.
     /// - **Retrigger at non-zero start phase**: reset phase to create an intentional
     ///   transient. Velocity jumps immediately.
     pub fn note_on(&mut self, params: NoteOnParams) {
+        let was_idle = self.env.is_idle();
         self.note = Some(params.note);
         self.base_freq = params.base_freq;
         self.age = params.age;
 
         // Determine retrigger strategy based on current envelope state and start phase.
-        let smooth_retrigger = !self.env.is_idle() && params.start_phase_normalized == 0.0;
+        let smooth_retrigger = !was_idle && params.start_phase_normalized == 0.0;
 
         if smooth_retrigger {
             // 0° retrigger: phase continues, velocity ramps over ~2ms.
@@ -152,7 +166,26 @@ impl Voice {
         }
 
         self.env.set_attack(params.attack_ms, params.sample_rate);
-        self.env.note_on();
+
+        if was_idle && params.start_phase_normalized != 0.0 {
+            // Starting from silence with non-zero start phase: compute transient
+            // level gated by attack time. Short attacks allow the click through;
+            // long attacks suppress it to preserve the intended swell.
+            //
+            // transient_amplitude = |sin(start_phase × 2π)| — the waveform value
+            //   at the start phase position (0° = 0.0, 90° = 1.0).
+            // gate = linear ramp from 1.0 (at MIN_ATTACK_MS) to 0.0 (at TRANSIENT_GATE_MS).
+            let transient_amplitude = (params.start_phase_normalized * std::f32::consts::TAU)
+                .sin()
+                .abs();
+            let gate = ((TRANSIENT_GATE_MS - params.attack_ms)
+                / (TRANSIENT_GATE_MS - MIN_ATTACK_MS))
+                .clamp(0.0, 1.0);
+            let initial_level = transient_amplitude * gate;
+            self.env.note_on_at_level(initial_level);
+        } else {
+            self.env.note_on();
+        }
     }
 
     /// Release this voice's envelope. Called on NoteOff.
@@ -259,18 +292,9 @@ mod tests {
     const A4_FREQ: f32 = 440.0;
     const A4_NOTE: u8 = 69;
 
-    /// Helper: trigger a note on a voice with standard test parameters.
+    /// Helper: trigger a note on a voice with standard test parameters (10ms attack).
     fn trigger_voice(voice: &mut Voice, note: u8, velocity: f32, start_phase_norm: f32) {
-        let base_freq = util::midi_note_to_freq(note);
-        voice.note_on(NoteOnParams {
-            note,
-            velocity,
-            base_freq,
-            start_phase_normalized: start_phase_norm,
-            sample_rate: SR,
-            attack_ms: 10.0,
-            age: 1,
-        });
+        trigger_voice_with_attack(voice, note, velocity, start_phase_norm, 10.0);
     }
 
     #[test]
@@ -532,6 +556,74 @@ mod tests {
         // voice_count=2, so only slots 0..2 are searched.
         // Both are active, so steal oldest (index 0, age 1).
         assert_eq!(allocate_voice(&voices, 2), 0);
+    }
+
+    // --- start phase transient tests ---
+
+    /// Helper: trigger a note with a specific attack time.
+    fn trigger_voice_with_attack(
+        voice: &mut Voice,
+        note: u8,
+        velocity: f32,
+        start_phase_norm: f32,
+        attack_ms: f32,
+    ) {
+        let base_freq = util::midi_note_to_freq(note);
+        voice.note_on(NoteOnParams {
+            note,
+            velocity,
+            base_freq,
+            start_phase_normalized: start_phase_norm,
+            sample_rate: SR,
+            attack_ms,
+            age: 1,
+        });
+    }
+
+    #[test]
+    fn voice_from_silence_at_90_degrees_short_attack_has_immediate_output() {
+        let mut voice = Voice::default();
+        // 90° = 0.25 normalized, 1ms attack (fully open gate).
+        trigger_voice_with_attack(&mut voice, A4_NOTE, 1.0, 0.25, 1.0);
+
+        // First render_sample should produce non-negligible output because
+        // the envelope starts at initial_level = |sin(90°)| * 1.0 = 1.0.
+        let (l, r) = voice.render_sample(0.0, SR);
+        let mono = l.abs().max(r.abs());
+        assert!(
+            mono > 0.5,
+            "90° start phase with 1ms attack should produce immediate output, got {mono}"
+        );
+    }
+
+    #[test]
+    fn voice_from_silence_at_90_degrees_long_attack_starts_quiet() {
+        let mut voice = Voice::default();
+        // 90° = 0.25 normalized, 500ms attack (gate fully closed).
+        trigger_voice_with_attack(&mut voice, A4_NOTE, 1.0, 0.25, 500.0);
+
+        // First sample should be near zero — long attack suppresses the transient.
+        let (l, r) = voice.render_sample(0.0, SR);
+        let mono = l.abs().max(r.abs());
+        assert!(
+            mono < 0.01,
+            "90° start phase with 500ms attack should start quiet, got {mono}"
+        );
+    }
+
+    #[test]
+    fn voice_from_silence_at_zero_degrees_starts_quiet() {
+        let mut voice = Voice::default();
+        // 0° = 0.0 normalized, 1ms attack (gate open, but sin(0) = 0).
+        trigger_voice_with_attack(&mut voice, A4_NOTE, 1.0, 0.0, 1.0);
+
+        // First sample should be near zero — sin(0°) = 0, no transient regardless.
+        let (l, r) = voice.render_sample(0.0, SR);
+        let mono = l.abs().max(r.abs());
+        assert!(
+            mono < 0.01,
+            "0° start phase should start quiet regardless of attack, got {mono}"
+        );
     }
 
     // --- pan smoothing tests ---
