@@ -9,6 +9,11 @@ use nih_plug::prelude::*;
 ///
 /// DSP state (oscillator phase, envelope level) does NOT belong here —
 /// it lives on the plugin struct. Params holds only what the user controls.
+///
+/// FIXME(bitwig_defaults): Bitwig's "Set to Default" resets CLAP params to
+///   min_value (0.0 normalized) instead of the reported default_value. nih-plug
+///   correctly reports default_value (verified by unit tests and clap-validator),
+///   so this appears to be a Bitwig host behavior. All three params are affected.
 #[derive(Params)]
 pub struct SineOneParams {
     /// Pitch offset in cents. ±100 cents = ±1 semitone.
@@ -106,5 +111,65 @@ mod tests {
             "release default {release_val} out of range"
         );
         assert_eq!(release_val, 300.0, "release default should be 300.0 ms");
+    }
+
+    /// Verify that default values survive a normalize→unnormalize round-trip.
+    /// This catches any floating-point drift that could cause the host's
+    /// "reset to default" to produce a different value than the initial state.
+    #[test]
+    fn param_defaults_survive_normalize_round_trip() {
+        let params = SineOneParams::default();
+
+        // Fine Tune: Linear range, should round-trip exactly.
+        let ft_norm = params.fine_tune.preview_normalized(0.0);
+        let ft_plain = params.fine_tune.preview_plain(ft_norm);
+        assert!(
+            (ft_plain - 0.0).abs() < 0.01,
+            "fine_tune round-trip: expected 0.0, got {ft_plain}"
+        );
+
+        // Attack: Skewed range, verify round-trip within step_size tolerance.
+        let atk_norm = params.attack.preview_normalized(10.0);
+        let atk_plain = params.attack.preview_plain(atk_norm);
+        assert!(
+            (atk_plain - 10.0).abs() < 0.1,
+            "attack round-trip: expected 10.0, got {atk_plain}"
+        );
+
+        // Release: Skewed range, verify round-trip within step_size tolerance.
+        let rel_norm = params.release.preview_normalized(300.0);
+        let rel_plain = params.release.preview_plain(rel_norm);
+        assert!(
+            (rel_plain - 300.0).abs() < 0.1,
+            "release round-trip: expected 300.0, got {rel_plain}"
+        );
+    }
+
+    /// Verify that the normalized default values reported to the CLAP host
+    /// are correct. The host uses these for "Reset to Default".
+    #[test]
+    fn param_normalized_defaults_correct() {
+        let params = SineOneParams::default();
+
+        // Fine Tune: Linear -100..100, default 0.0 → normalized 0.5.
+        let ft_norm = params.fine_tune.default_normalized_value();
+        assert!(
+            (ft_norm - 0.5).abs() < 1e-6,
+            "fine_tune normalized default: expected 0.5, got {ft_norm}"
+        );
+
+        // Attack: Skewed 1..5000, default 10.0 → normalized ~0.206.
+        let atk_norm = params.attack.default_normalized_value();
+        assert!(
+            atk_norm > 0.1 && atk_norm < 0.3,
+            "attack normalized default: expected ~0.206, got {atk_norm}"
+        );
+
+        // Release: Skewed 1..10000, default 300.0 → normalized ~0.416.
+        let rel_norm = params.release.default_normalized_value();
+        assert!(
+            rel_norm > 0.3 && rel_norm < 0.5,
+            "release normalized default: expected ~0.416, got {rel_norm}"
+        );
     }
 }
