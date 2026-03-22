@@ -143,6 +143,10 @@ impl Plugin for SineOne {
             self.gain_smoother.set_target(target_gain, ramp_samples);
         }
 
+        // Read output gain once per block — no smoother, so the value is
+        // constant across all samples. Hoisted to avoid per-sample powf.
+        let output_gain = util::db_to_gain(self.params.output_gain.value());
+
         for (sample_idx, mut channel_samples) in buffer.iter_samples().enumerate() {
             // Handle all MIDI events scheduled at this sample.
             while let Some(event) = next_event {
@@ -226,9 +230,10 @@ impl Plugin for SineOne {
                 }
             }
 
-            // Apply gain compensation.
-            left_sum *= gain;
-            right_sum *= gain;
+            // Apply voice gain compensation and output gain.
+            let combined_gain = gain * output_gain;
+            left_sum *= combined_gain;
+            right_sum *= combined_gain;
 
             // Write to stereo output. AUDIO_IO_LAYOUTS guarantees exactly 2 channels.
             let mut channels = channel_samples.iter_mut();
@@ -363,6 +368,15 @@ mod tests {
         initialize_plugin(plugin, sample_rate)
     }
 
+    /// Helper: construct a plugin with a custom output gain (dB) and call initialize().
+    fn init_plugin_with_output_gain(sample_rate: f32, db: f32) -> SineOne {
+        let plugin = SineOne {
+            params: Arc::new(SineOneParams::with_output_gain(db)),
+            ..SineOne::default()
+        };
+        initialize_plugin(plugin, sample_rate)
+    }
+
     /// Helper: call `process()` on the plugin with a stereo buffer of the given
     /// size and the provided MIDI events. Returns the left and right channel data.
     fn run_process(
@@ -386,6 +400,12 @@ mod tests {
         let status = plugin.process(&mut buffer, &mut aux, &mut context);
         assert_eq!(status, ProcessStatus::Normal);
         (left, right)
+    }
+
+    /// Compute root-mean-square of a sample buffer.
+    fn rms(samples: &[f32]) -> f32 {
+        let sum: f32 = samples.iter().map(|s| s * s).sum();
+        (sum / samples.len() as f32).sqrt()
     }
 
     #[test]
@@ -1083,10 +1103,6 @@ mod tests {
         let (left_1, _) = run_process(&mut plugin_1, 512, events());
         let (left_4, _) = run_process(&mut plugin_4, 512, events());
 
-        let rms = |samples: &[f32]| -> f32 {
-            let sum: f32 = samples.iter().map(|s| s * s).sum();
-            (sum / samples.len() as f32).sqrt()
-        };
         let rms_1 = rms(&left_1);
         let rms_4 = rms(&left_4);
         let ratio = rms_1 / rms_4;
@@ -1241,6 +1257,62 @@ mod tests {
         assert!(
             left.iter().all(|&s| s.abs() < 1e-6),
             "left channel should be silent at hard-right pan in mono mode"
+        );
+    }
+
+    #[test]
+    fn output_gain_attenuates_output() {
+        // At -6 dB, output amplitude should be roughly half of 0 dB.
+        let mut plugin_0db = init_plugin_with_output_gain(44100.0, 0.0);
+        let mut plugin_minus6 = init_plugin_with_output_gain(44100.0, -6.0);
+
+        let events = || {
+            vec![NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            }]
+        };
+
+        let (left_0, _) = run_process(&mut plugin_0db, 512, events());
+        let (left_6, _) = run_process(&mut plugin_minus6, 512, events());
+
+        let ratio = rms(&left_0) / rms(&left_6);
+
+        // -6 dB ≈ 0.501 linear gain, so ratio should be ~2.0.
+        assert!(
+            (ratio - 2.0).abs() < 0.3,
+            "output at -6 dB should be ~half of 0 dB, ratio was {ratio}"
+        );
+    }
+
+    #[test]
+    fn output_gain_amplifies_output() {
+        // At +6 dB, output amplitude should be roughly double 0 dB.
+        let mut plugin_0db = init_plugin_with_output_gain(44100.0, 0.0);
+        let mut plugin_plus6 = init_plugin_with_output_gain(44100.0, 6.0);
+
+        let events = || {
+            vec![NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            }]
+        };
+
+        let (left_0, _) = run_process(&mut plugin_0db, 512, events());
+        let (left_6, _) = run_process(&mut plugin_plus6, 512, events());
+
+        let ratio = rms(&left_6) / rms(&left_0);
+
+        // +6 dB ≈ 1.995 linear gain, so ratio should be ~2.0.
+        assert!(
+            (ratio - 2.0).abs() < 0.3,
+            "output at +6 dB should be ~double 0 dB, ratio was {ratio}"
         );
     }
 }

@@ -42,6 +42,11 @@ pub struct SineOneParams {
     /// Read at the start of each process block — no smoothing needed.
     #[id = "voices"]
     pub voices: IntParam,
+
+    /// Output gain in dB (-24 to +12). Applied after voice gain compensation
+    /// as a final scaling factor. Default 0 dB (unity gain).
+    #[id = "output_gain"]
+    pub output_gain: FloatParam,
 }
 
 impl Default for SineOneParams {
@@ -90,11 +95,29 @@ impl Default for SineOneParams {
             start_phase: Self::build_start_phase(0.0),
 
             voices: IntParam::new("Voices", 1, IntRange::Linear { min: 1, max: 8 }),
+
+            output_gain: Self::build_output_gain(0.0),
         }
     }
 }
 
 impl SineOneParams {
+    /// Build the output_gain FloatParam with the given default value.
+    /// Shared between `Default` and the test helper to avoid duplicating
+    /// range, unit, and step_size definitions.
+    fn build_output_gain(default_db: f32) -> FloatParam {
+        FloatParam::new(
+            "Output Gain",
+            default_db,
+            FloatRange::Linear {
+                min: -24.0,
+                max: 12.0,
+            },
+        )
+        .with_unit(" dB")
+        .with_step_size(0.1)
+    }
+
     /// Build the start_phase FloatParam with the given default value.
     /// Shared between `Default` and the test helper to avoid duplicating
     /// range, unit, and step_size definitions.
@@ -124,11 +147,16 @@ impl SineOneParams {
     }
 
     /// Create params with a custom voice count for testing.
-    /// Works around nih-plug's `ParamMut` being `pub(crate)` by constructing
-    /// the `IntParam` with the desired value baked in as the default.
     pub fn with_voices(voice_count: i32) -> Self {
         let mut params = Self::default();
         params.voices = IntParam::new("Voices", voice_count, IntRange::Linear { min: 1, max: 8 });
+        params
+    }
+
+    /// Create params with a custom output gain (dB) for testing.
+    pub fn with_output_gain(db: f32) -> Self {
+        let mut params = Self::default();
+        params.output_gain = Self::build_output_gain(db);
         params
     }
 }
@@ -182,6 +210,14 @@ mod tests {
             "voices default {voices_val} out of range"
         );
         assert_eq!(voices_val, 1, "voices default should be 1");
+
+        // Output Gain: range -24..+12 dB, default 0.0
+        let og_val = params.output_gain.value();
+        assert!(
+            (-24.0..=12.0).contains(&og_val),
+            "output_gain default {og_val} out of range"
+        );
+        assert_eq!(og_val, 0.0, "output_gain default should be 0.0 dB");
     }
 
     /// Verify that default values survive a normalize→unnormalize round-trip.
@@ -227,6 +263,14 @@ mod tests {
         let v_norm = params.voices.preview_normalized(1);
         let v_plain = params.voices.preview_plain(v_norm);
         assert_eq!(v_plain, 1, "voices round-trip: expected 1, got {v_plain}");
+
+        // Output Gain: Linear -24..+12, default 0.0.
+        let og_norm = params.output_gain.preview_normalized(0.0);
+        let og_plain = params.output_gain.preview_plain(og_norm);
+        assert!(
+            (og_plain - 0.0).abs() < 0.01,
+            "output_gain round-trip: expected 0.0, got {og_plain}"
+        );
     }
 
     /// Verify that the normalized default values reported to the CLAP host
@@ -268,6 +312,13 @@ mod tests {
         assert!(
             v_norm.abs() < 1e-6,
             "voices normalized default: expected 0.0, got {v_norm}"
+        );
+
+        // Output Gain: Linear -24..+12, default 0.0 → normalized 24/36 ≈ 0.667.
+        let og_norm = params.output_gain.default_normalized_value();
+        assert!(
+            (og_norm - 24.0 / 36.0).abs() < 1e-4,
+            "output_gain normalized default: expected ~0.667, got {og_norm}"
         );
     }
 }
