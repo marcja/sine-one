@@ -169,14 +169,26 @@ impl Plugin for SineOne {
                                 .note_off(self.params.release.value(), self.sample_rate);
                         }
                     }
-                    // TODO(poly_pan): Route pan to the voice matching this note
-                    //   event. Currently hardcoded to voices[0] for backward
-                    //   compatibility with monophonic behavior. With voices=1,
-                    //   accepting all PolyPan regardless of note field is correct
-                    //   since PolyPan may arrive before NoteOn in the same buffer
-                    //   (e.g., from Bitwig's Randomize device).
-                    NoteEvent::PolyPan { pan, .. } => {
-                        self.voices[0].set_pan(pan);
+                    // REVIEW(pan_smoothing): Pan changes apply instantly at
+                    //   the sample they arrive. If continuous pan automation
+                    //   causes audible zipper noise, add a one-pole smoother.
+                    //   Unlikely for per-note pan from Bitwig's Randomize device.
+                    NoteEvent::PolyPan { note, pan, .. } => {
+                        if voice_count == 1 {
+                            // NOTE(mono_pan): In mono mode, accept all PolyPan
+                            //   regardless of note field. PolyPan may arrive before
+                            //   NoteOn in the same buffer (e.g., from Bitwig's
+                            //   Randomize device).
+                            self.voices[0].set_pan(pan);
+                        } else {
+                            // Route to the voice playing this note.
+                            if let Some(voice) = self.voices[..MAX_VOICES]
+                                .iter_mut()
+                                .find(|v| v.note() == Some(note))
+                            {
+                                voice.set_pan(pan);
+                            }
+                        }
                     }
                     _ => (),
                 }
@@ -1110,6 +1122,110 @@ mod tests {
         assert_ne!(
             left_two, left_one,
             "two simultaneous notes should produce different output than one"
+        );
+    }
+
+    // --- PolyPan routing tests ---
+
+    #[test]
+    fn poly_pan_routes_to_correct_voice() {
+        let mut plugin = init_plugin_with_voices(44100.0, 4);
+
+        // Play one note and pan it hard-right via PolyPan targeting that note.
+        // A second note has no PolyPan, so it stays at center.
+        let events = vec![
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 60,
+                velocity: 1.0,
+            },
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 64,
+                velocity: 1.0,
+            },
+            // Pan note 64 hard-right; note 60 stays at center.
+            NoteEvent::PolyPan {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 64,
+                pan: 1.0,
+            },
+        ];
+        run_process(&mut plugin, 256, events);
+
+        // Verify that the voice playing note 64 has pan 1.0, and the voice
+        // playing note 60 is still at center (0.0).
+        let voice_60 = plugin.voices.iter().find(|v| v.note() == Some(60));
+        let voice_64 = plugin.voices.iter().find(|v| v.note() == Some(64));
+
+        assert!(voice_60.is_some(), "voice playing note 60 should exist");
+        assert!(voice_64.is_some(), "voice playing note 64 should exist");
+
+        assert!(
+            (voice_60.unwrap().pan() - 0.0).abs() < 1e-6,
+            "note 60 should have center pan, got {}",
+            voice_60.unwrap().pan()
+        );
+        assert!(
+            (voice_64.unwrap().pan() - 1.0).abs() < 1e-6,
+            "note 64 should have hard-right pan, got {}",
+            voice_64.unwrap().pan()
+        );
+    }
+
+    #[test]
+    fn poly_pan_no_voice_is_ignored() {
+        let mut plugin = init_plugin_with_voices(44100.0, 4);
+
+        // Send PolyPan for a note that isn't playing — should not panic.
+        let events = vec![NoteEvent::PolyPan {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 72, // not playing
+            pan: 1.0,
+        }];
+        run_process(&mut plugin, 64, events);
+        // No panic = pass.
+    }
+
+    #[test]
+    fn poly_pan_mono_mode_unchanged() {
+        let mut plugin = init_plugin_with_voices(44100.0, 1);
+
+        // In mono mode, PolyPan should still work regardless of note matching.
+        let events = vec![
+            NoteEvent::PolyPan {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 99, // different note than what we'll play
+                pan: 1.0,
+            },
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            },
+        ];
+        let (left, right) = run_process(&mut plugin, 256, events);
+
+        // Hard-right pan: left should be ~0, right should have energy.
+        assert!(
+            right.iter().any(|&s| s != 0.0),
+            "right channel should have output at hard-right pan in mono mode"
+        );
+        assert!(
+            left.iter().all(|&s| s.abs() < 1e-6),
+            "left channel should be silent at hard-right pan in mono mode"
         );
     }
 }
