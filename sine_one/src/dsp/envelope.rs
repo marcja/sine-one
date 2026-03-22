@@ -113,6 +113,13 @@ impl ArEnvelope {
         self.state == EnvState::Idle
     }
 
+    /// Returns `true` when the envelope is in the Release state (fading out).
+    /// Used by the voice allocator to prefer stealing releasing voices over
+    /// voices that are still in the attack/hold phase.
+    pub fn is_releasing(&self) -> bool {
+        self.state == EnvState::Release
+    }
+
     /// Zero all state. Called by `Plugin::reset()`.
     pub fn reset(&mut self) {
         self.state = EnvState::Idle;
@@ -363,6 +370,45 @@ mod tests {
             env.next_sample();
         }
         assert!(!env.is_idle(), "envelope should not be idle during release");
+    }
+
+    #[test]
+    fn is_releasing_during_release() {
+        let mut env = make_envelope(10.0, 100.0);
+        env.note_on();
+        // Complete attack.
+        let attack_samples = (10.0 * 44100.0 / 1000.0) as usize;
+        for _ in 0..attack_samples + 10 {
+            env.next_sample();
+        }
+        env.note_off();
+        // Advance partway through release.
+        for _ in 0..500 {
+            env.next_sample();
+        }
+        assert!(
+            env.is_releasing(),
+            "envelope should be releasing during release phase"
+        );
+    }
+
+    #[test]
+    fn is_not_releasing_during_attack() {
+        let mut env = make_envelope(10.0, 100.0);
+        env.note_on();
+        assert!(
+            !env.is_releasing(),
+            "envelope should not be releasing during attack"
+        );
+    }
+
+    #[test]
+    fn is_not_releasing_when_idle() {
+        let env = ArEnvelope::default();
+        assert!(
+            !env.is_releasing(),
+            "fresh envelope should not be releasing"
+        );
     }
 
     #[test]
