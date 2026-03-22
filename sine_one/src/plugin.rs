@@ -22,6 +22,9 @@ pub struct SineOne {
     current_note: Option<u8>,
     /// Velocity of the current note, normalized to [0.0, 1.0].
     current_velocity: f32,
+    /// Cached base frequency (Hz) for the current note, before fine-tune.
+    /// Stored to avoid recomputing `midi_note_to_freq` every sample.
+    current_base_freq: f32,
 }
 
 impl Default for SineOne {
@@ -33,6 +36,7 @@ impl Default for SineOne {
             envelope: ArEnvelope::default(),
             current_note: None,
             current_velocity: 0.0,
+            current_base_freq: 0.0,
         }
     }
 }
@@ -88,6 +92,7 @@ impl Plugin for SineOne {
         self.envelope.reset();
         self.current_note = None;
         self.current_velocity = 0.0;
+        self.current_base_freq = 0.0;
     }
 
     fn process(
@@ -111,16 +116,10 @@ impl Plugin for SineOne {
                         // nih-plug normalizes velocity to [0.0, 1.0].
                         self.current_velocity = velocity;
 
-                        // Compute frequency: MIDI note → Hz, with fine-tune offset.
-                        // REVIEW(fine_tune): reads .value() at NoteOn only — the Linear(20ms)
-                        //   smoother on fine_tune is not consumed per-sample. To support smooth
-                        //   pitch automation, read .smoothed.next() per-sample and update
-                        //   oscillator frequency in the audio loop. Deferred to keep process()
-                        //   simple for the first audible build.
-                        let base_freq = util::midi_note_to_freq(note);
-                        let fine_tune_cents = self.params.fine_tune.value();
-                        let freq = crate::dsp::oscillator::apply_detune(base_freq, fine_tune_cents);
-                        self.oscillator.set_frequency(freq, self.sample_rate);
+                        // Cache the base frequency for this note. The per-sample loop
+                        // applies fine-tune on top of this each sample, so we avoid
+                        // recomputing midi_note_to_freq every sample.
+                        self.current_base_freq = util::midi_note_to_freq(note);
 
                         // Read attack time from params and trigger the envelope.
                         self.envelope
@@ -140,6 +139,18 @@ impl Plugin for SineOne {
                 }
 
                 next_event = context.next_event();
+            }
+
+            // Read smoothed fine-tune value per-sample to support real-time
+            // pitch modulation (vibrato, automation). The smoother must be
+            // consumed every sample even when no note is active.
+            let fine_tune_cents = self.params.fine_tune.smoothed.next();
+
+            // Update oscillator frequency per-sample when a note is active.
+            if self.current_note.is_some() {
+                let freq =
+                    crate::dsp::oscillator::apply_detune(self.current_base_freq, fine_tune_cents);
+                self.oscillator.set_frequency(freq, self.sample_rate);
             }
 
             // Generate audio: oscillator × envelope × velocity.
@@ -342,6 +353,7 @@ mod tests {
         // Simulate a note being active.
         plugin.current_note = Some(69);
         plugin.current_velocity = 100.0 / 127.0;
+        plugin.current_base_freq = 440.0;
 
         plugin.reset();
 
@@ -352,6 +364,10 @@ mod tests {
         assert_eq!(
             plugin.current_velocity, 0.0,
             "current_velocity should be 0.0 after reset"
+        );
+        assert_eq!(
+            plugin.current_base_freq, 0.0,
+            "current_base_freq should be 0.0 after reset"
         );
     }
 
