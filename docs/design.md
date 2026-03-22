@@ -489,33 +489,33 @@ If this produces zero failures, you're safe to load in Bitwig.
 
 ### Performance Benchmarks (`criterion`)
 
-Target: process a 512-sample block well under the ~11.6ms budget at 44100 Hz.
-The DSP is trivial, so these benchmarks primarily teach the benchmark workflow.
+Target: process a 512-sample block well under the ~11.6ms audio deadline at 44100 Hz.
 
-Three benchmarks in `benches/dsp_bench.rs`:
-- `oscillator_512_samples` — oscillator only, 512 samples at 440 Hz / 44100 Hz
-- `envelope_attack_512_samples` — envelope only, 512 samples during attack phase
-- `combined_dsp_512_samples` — oscillator × envelope × velocity, mirroring the per-sample work
-  in `process()`
+Seven benchmarks in `benches/dsp_bench.rs`, organized into three Criterion groups. All benchmarks
+report throughput in samples/second via `Throughput::Elements`.
 
-```rust
-// benches/dsp_bench.rs (simplified)
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+**Group 1: `component`** — isolated DSP primitives for diagnostic isolation:
+- `oscillator_512` — sine oscillator: phase accumulation + `sin()`
+- `envelope_attack_512` — envelope attack ramp (recreated per iteration)
+- `combined_dsp_512` — oscillator × envelope × velocity (recreated per iteration)
+- `apply_detune_512` — `2^(cents/1200)` via `powf()` with `black_box`'d inputs to prevent
+  constant-folding
 
-fn oscillator_512_samples(c: &mut Criterion) {
-    c.bench_function("oscillator_512_samples", |b| {
-        let mut osc = SineOscillator::default();
-        osc.set_frequency(440.0, 44100.0);
-        b.iter(|| {
-            for _ in 0..512 {
-                black_box(osc.next_sample());
-            }
-        });
-    });
-}
+**Group 2: `voice`** — production hot path at the Voice level:
+- `single_voice_512` — full `Voice::render_sample()` with non-zero fine-tune (exercises `powf`,
+  oscillator, envelope, velocity smoother, and pan smoothers)
+- `8_voices_512` — 8 active voices summed to stereo with gain compensation (worst-case polyphony)
 
-criterion_group!(benches, oscillator_512_samples, /* ... */);
-criterion_main!(benches);
+**Group 3: `realtime`** — single scalar metric for automated optimization:
+- `8v_512_deadline` — same 8-voice workload as `8_voices_512`, with reduced warm-up (500ms) and
+  measurement time (3s) for fast iteration. Designed as the scalar metric for a
+  [Karpathy Loop](https://github.com/karpathy/autoresearch) automated optimization workflow.
+  An external agent computes: `real_time_ratio = median_ns / 11_609_977 × 100%` (where
+  11,609,977 ns = 512 / 44100 seconds, the audio deadline).
+
+```bash
+cargo bench                          # run all 7 benchmarks
+cargo bench -- "realtime/8v_512"     # run only the scalar metric
 ```
 
 ### Realtime Safety Checklist
