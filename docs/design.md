@@ -8,10 +8,11 @@
 
 ## Overview
 
-SineOne is a minimal monophonic sine-wave synthesizer CLAP plugin. It accepts MIDI NoteOn/NoteOff
-events, plays a sine oscillator tuned to the incoming note pitch, and shapes the output with a
-two-stage AR (Attack/Release) envelope. There is no filter, no GUI, and no polyphony. The entire
-codebase is intentionally small so every line is traceable back to a design decision documented here.
+SineOne is a minimal polyphonic sine-wave synthesizer CLAP plugin. It accepts MIDI NoteOn/NoteOff
+events, plays up to 8 simultaneous sine oscillators tuned to incoming note pitches, and shapes each
+voice's output with a two-stage AR (Attack/Release) envelope. There is no filter, no GUI, and no
+effects. The entire codebase is intentionally small so every line is traceable back to a design
+decision documented here.
 
 ---
 
@@ -24,7 +25,7 @@ codebase is intentionally small so every line is traceable back to a design deci
 | Audio output | Stereo (mono signal with constant-power panning via PolyPan expression events) |
 | MIDI input | `MidiConfig::Basic` — NoteOn, NoteOff, and polyphonic expressions (PolyPan) |
 | MIDI output | None |
-| CLAP features | `CLAP_FEATURE_INSTRUMENT`, `CLAP_FEATURE_SYNTHESIZER`, `CLAP_FEATURE_MONO` |
+| CLAP features | `CLAP_FEATURE_INSTRUMENT`, `CLAP_FEATURE_SYNTHESIZER`, `CLAP_FEATURE_MONO` (when Voices=1) |
 | GUI | None — generic host parameter list |
 
 **Why stereo out?** Most DAWs expect instruments to produce stereo output. The plugin applies
@@ -36,10 +37,15 @@ stereo field. With no PolyPan event, output defaults to center (equal L/R).
 ## DSP Architecture
 
 ```
-MIDI NoteOn ──► SineOscillator ──► ArEnvelope ──► gain (velocity) ──► Pan ──► [L] out
-                    │                                                          [R] out
-MIDI NoteOff ───────┘ (triggers Release phase)
-MIDI PolyPan ──────────────────────────────────────────────────────────► Pan
+                 ┌─────────────── Voice 0 ───────────────────────┐
+MIDI NoteOn ──►  │ SineOscillator → ArEnvelope → Vel → Pan Gains │──┐
+allocate_voice() └───────────────────────────────────────────────┘  │
+                 ┌─────────────── Voice 1 ───────────────────────┐  ├─► Sum → Gain(1/N) → [L,R]
+                 │ SineOscillator → ArEnvelope → Vel → Pan Gains │──┤
+                 └───────────────────────────────────────────────┘  │
+                 ...up to Voice 7                                   ┘
+MIDI NoteOff ──► oldest voice with matching note → Release phase
+MIDI PolyPan ──► voice with matching note → update pan gains
 ```
 
 ### SineOscillator
@@ -147,8 +153,72 @@ added later, a one-pole smoother could be inserted here.
 `reset()`. It is not reset on NoteOn. This matches the behavior of Bitwig's Randomize device,
 which may send PolyPan before or after NoteOn in the same buffer.
 
-**All PolyPan events are accepted** regardless of the `note` field. This is a monophonic synth
-with one voice — strict note matching would drop events that arrive before NoteOn.
+**Polyphonic PolyPan routing:** When `Voices > 1`, PolyPan events are routed to the voice
+playing the matching MIDI note. When `Voices = 1` (mono mode), all PolyPan events are accepted
+regardless of the `note` field — strict note matching would drop events that arrive before NoteOn.
+
+---
+
+## Polyphony
+
+SineOne supports 1–8 polyphonic voices via the `Voices` parameter. Each voice is an independent
+signal path (oscillator + envelope + velocity + pan). The plugin sums all active voices and applies
+gain compensation.
+
+### Voice Architecture
+
+```
+                 ┌─ Voice 0: Osc → Env → Vel → Pan ─┐
+MIDI NoteOn ──►  ├─ Voice 1: Osc → Env → Vel → Pan ─┤──► Sum ──► Gain (1/N) ──► [L, R] out
+                 ├─ Voice 2: ...                     ┤
+allocate_voice() └─ Voice N-1: ...                   ┘
+```
+
+Each `Voice` struct (in `dsp/voice.rs`) bundles `SineOscillator`, `ArEnvelope`, `LinearSmoother`
+(velocity), pan gains, a MIDI note, a base frequency, and a monotonic age counter. All fields are
+stack-allocated — no heap allocation in the audio path.
+
+### Voice Stealing: Oldest Voice with Release Priority
+
+When all voice slots are occupied and a new NoteOn arrives, the allocator steals a voice:
+
+1. **First idle voice** — no stealing needed
+2. **Oldest voice in Release state** — already fading out, least disruptive to steal
+3. **Oldest voice in Attack/hold state** — last resort
+
+"Oldest" = lowest `age` counter (a `u64` bumped on each `note_on()`).
+
+This strategy was chosen for its simplicity (one comparison, no amplitude analysis) and good
+musical results (releasing voices are preferentially reclaimed).
+
+### Gain Compensation
+
+The summed output is divided by the configured voice count:
+
+```
+gain = 1.0 / voices_param
+output_L = sum_L * gain
+output_R = sum_R * gain
+```
+
+This means a single note at `Voices=4` is 4× quieter than at `Voices=1`. This is standard
+behavior for polyphonic synthesizers. The gain factor is smoothed over ~5ms via `LinearSmoother`
+to avoid clicks when the `Voices` parameter changes at runtime.
+
+### NoteOff Routing
+
+On NoteOff, the plugin scans **all** voice slots (not just `[0..voice_count]`) for the oldest
+voice playing the matching note. This ensures voices that are releasing beyond the current voice
+count (after the user decreased `Voices`) can still be found and released properly.
+
+### Voice Count Changes at Runtime
+
+When `Voices` decreases from N to M (M < N):
+- Voices in slots M..N receive `note_off()` and fade out via their release envelopes
+- New notes are only allocated to slots 0..M
+- The render loop still ticks all MAX_VOICES slots to allow releasing voices to complete
+
+When `Voices` increases: no immediate effect. New slots become available for the next NoteOn.
 
 ---
 
@@ -160,6 +230,7 @@ with one voice — strict note matching would drop events that arrive before Not
 | Attack | `"attack"` | `FloatParam` | 1 to 5000 | 10.0 | `None` | ms | Skewed (log-ish feel) |
 | Release | `"release"` | `FloatParam` | 1 to 10000 | 300.0 | `None` | ms | Skewed (log-ish feel) |
 | Start Phase | `"start_phase"` | `FloatParam` | 0 to 360 | 0.0 | `None` | ° | Oscillator phase on NoteOn |
+| Voices | `"voices"` | `IntParam` | 1 to 8 | 1 | `None` | — | Polyphonic voice count |
 
 **Notes on smoothing choices:**
 - `Fine Tune` uses `Linear(20ms)` so pitch slides smoothly when automated (avoids zipper noise).
@@ -181,13 +252,13 @@ the display name on purpose.
 
 ## State & Preset Design
 
-All plugin state is captured by the three `Params` fields — no custom serialization needed. When
+All plugin state is captured by the five `Params` fields — no custom serialization needed. When
 the DAW saves a project or preset, nih-plug serializes the `Params` struct automatically via the
 `#[derive(Params)]` macro.
 
-DSP state (oscillator phase, envelope state, current velocity, current note) is **not** persisted.
-On reload, the voice starts silent (Idle envelope, phase 0) and waits for the next NoteOn, which
-is correct behavior.
+DSP state (oscillator phases, envelope states, current velocities, current notes, voice ages) is
+**not** persisted. On reload, all voices start silent (Idle envelope, phase 0) and wait for the
+next NoteOn, which is correct behavior.
 
 ---
 
@@ -207,13 +278,14 @@ sine-one/
     └── src/
         ├── lib.rs          # nih_export_clap!(plugin::SineOne); re-exports
         ├── plugin.rs       # SineOne struct + Plugin trait impl (process, initialize, reset)
-        ├── params.rs       # SineOneParams struct with three FloatParams
+        ├── params.rs       # SineOneParams struct with four FloatParams + one IntParam
         ├── dsp/
-        │   ├── mod.rs      # pub mod oscillator; pub mod envelope; pub mod pan; pub mod smoother;
+        │   ├── mod.rs      # pub mod oscillator; envelope; pan; smoother; voice;
         │   ├── oscillator.rs   # SineOscillator: phase, set_frequency(), next_sample(), reset()
         │   ├── envelope.rs     # ArEnvelope: EnvState enum, ArEnvelope struct, all methods
         │   ├── smoother.rs     # LinearSmoother: linear ramp for click-free parameter transitions
-        │   └── pan.rs          # apply_constant_power_pan(): stereo panning via sin/cos pan law
+        │   ├── pan.rs          # apply_constant_power_pan(): stereo panning via sin/cos pan law
+        │   └── voice.rs        # Voice: per-voice DSP bundle; allocate_voice(): voice stealing
         └── main.rs         # standalone binary: nih_export_standalone::<SineOne>()
 ```
 
@@ -429,7 +501,8 @@ criterion_main!(benches);
 - [x] `assert_process_allocs` feature enabled in `Cargo.toml`
 - [x] No `Vec::push`, `String::new`, or any allocation in `process()`
 - [x] No `Mutex` or `RwLock` in `process()` (no GUI shared state in this plugin anyway)
-- [x] Oscillator and envelope state live directly on the plugin struct (stack/inline), not in a `Box`
+- [x] Voice array (`[Voice; 8]`) lives directly on the plugin struct (stack/inline), not in a `Box`
+- [x] Per-voice pan gains are cached at event-rate, avoiding per-sample sin/cos calls
 
 ---
 
