@@ -186,23 +186,23 @@ impl Plugin for SineOne {
                                 .note_off(self.params.release.value(), self.sample_rate);
                         }
                     }
-                    // REVIEW(pan_smoothing): Pan changes apply instantly at
-                    //   the sample they arrive. If continuous pan automation
-                    //   causes audible zipper noise, add a one-pole smoother.
-                    //   Unlikely for per-note pan from Bitwig's Randomize device.
+                    // NOTE(pan_smoothing): Pan gains are smoothed over ~2ms
+                    //   via LinearSmoother in Voice to prevent clicks when
+                    //   PolyPan events arrive while the voice is producing
+                    //   audio (common in mono mode with Bitwig's Randomize).
                     NoteEvent::PolyPan { note, pan, .. } => {
                         if voice_count == 1 {
                             // NOTE(mono_pan): In mono mode, accept all PolyPan
                             //   regardless of note field. PolyPan may arrive before
                             //   NoteOn in the same buffer (e.g., from Bitwig's
                             //   Randomize device).
-                            self.voices[0].set_pan(pan);
+                            self.voices[0].set_pan(pan, self.sample_rate);
                         } else {
                             // Route to the voice playing this note.
                             if let Some(voice) =
                                 self.voices.iter_mut().find(|v| v.note() == Some(note))
                             {
-                                voice.set_pan(pan);
+                                voice.set_pan(pan, self.sample_rate);
                             }
                         }
                     }
@@ -415,6 +415,10 @@ mod tests {
         let _params = plugin.params();
     }
 
+    /// Number of samples to skip in pan assertions to allow the ~2ms pan
+    /// ramp to complete. Derived from `PAN_RAMP_SECS` at 44100 Hz + margin.
+    const PAN_RAMP_MARGIN: usize = (crate::dsp::voice::PAN_RAMP_SECS * 44100.0) as usize + 12;
+
     #[test]
     fn initialize_stores_sample_rate() {
         let plugin = init_plugin(48000.0);
@@ -584,10 +588,10 @@ mod tests {
             left.iter().any(|&s| s != 0.0),
             "left channel should have nonzero output at hard-left pan"
         );
-        // Right channel should be silent.
+        // Right channel should be silent after the pan ramp settles.
         assert!(
-            right.iter().all(|&s| s.abs() < 1e-6),
-            "right channel should be silent at hard-left pan"
+            right[PAN_RAMP_MARGIN..].iter().all(|&s| s.abs() < 1e-6),
+            "right channel should be silent at hard-left pan (after ramp)"
         );
     }
 
@@ -618,10 +622,10 @@ mod tests {
             right.iter().any(|&s| s != 0.0),
             "right channel should have nonzero output at hard-right pan"
         );
-        // Left channel should be silent.
+        // Left channel should be silent after the pan ramp settles.
         assert!(
-            left.iter().all(|&s| s.abs() < 1e-6),
-            "left channel should be silent at hard-right pan"
+            left[PAN_RAMP_MARGIN..].iter().all(|&s| s.abs() < 1e-6),
+            "left channel should be silent at hard-right pan (after ramp)"
         );
     }
 
@@ -659,8 +663,9 @@ mod tests {
             );
         }
 
-        // After the PolyPan (samples 128..256), hard-right → left should be ~0.
-        for i in mid as usize..256 {
+        // After the PolyPan and pan ramp settles, hard-right → left should be ~0.
+        let pan_settled = mid as usize + PAN_RAMP_MARGIN;
+        for i in pan_settled..256 {
             assert!(
                 left[i].abs() < 1e-6,
                 "after hard-right pan at sample {i}: left {} should be ~0",
@@ -728,14 +733,14 @@ mod tests {
         ];
         let (left, right) = run_process(&mut plugin, 256, events);
 
-        // Hard-right pan should persist: left silent, right nonzero.
+        // Hard-right pan should persist: left silent (after ramp), right nonzero.
         assert!(
             right.iter().any(|&s| s != 0.0),
             "right channel should have output when pan persists"
         );
         assert!(
-            left.iter().all(|&s| s.abs() < 1e-6),
-            "left channel should be silent when pan is hard-right"
+            left[PAN_RAMP_MARGIN..].iter().all(|&s| s.abs() < 1e-6),
+            "left channel should be silent when pan is hard-right (after ramp)"
         );
     }
 
@@ -1248,14 +1253,14 @@ mod tests {
         ];
         let (left, right) = run_process(&mut plugin, 256, events);
 
-        // Hard-right pan: left should be ~0, right should have energy.
+        // Hard-right pan: left should be ~0 (after ramp), right should have energy.
         assert!(
             right.iter().any(|&s| s != 0.0),
             "right channel should have output at hard-right pan in mono mode"
         );
         assert!(
-            left.iter().all(|&s| s.abs() < 1e-6),
-            "left channel should be silent at hard-right pan in mono mode"
+            left[PAN_RAMP_MARGIN..].iter().all(|&s| s.abs() < 1e-6),
+            "left channel should be silent at hard-right pan in mono mode (after ramp)"
         );
     }
 

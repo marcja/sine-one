@@ -3,21 +3,8 @@ use super::oscillator::{apply_detune, SineOscillator};
 use super::pan::apply_constant_power_pan;
 use super::smoother::LinearSmoother;
 
-/// Pre-computed constant-power pan gains. Caches the sin/cos results from
-/// `apply_constant_power_pan` so the trig is computed once per PolyPan event
-/// instead of once per sample.
-#[derive(Clone, Copy)]
-struct PanGains {
-    left: f32,
-    right: f32,
-}
-
-impl Default for PanGains {
-    fn default() -> Self {
-        // Default pan is center (0.0). Compute gains once.
-        let (left, right) = apply_constant_power_pan(1.0, 0.0);
-        Self { left, right }
-    }
+fn center_pan_gains() -> (f32, f32) {
+    apply_constant_power_pan(1.0, 0.0)
 }
 
 /// Maximum number of simultaneous voices the plugin supports.
@@ -27,6 +14,11 @@ pub const MAX_VOICES: usize = 8;
 /// Short enough to be imperceptible, long enough to avoid a gain click
 /// when retriggering with a different velocity.
 const VELOCITY_RAMP_SECS: f32 = 0.002;
+
+/// Duration of the pan gain crossfade ramp (seconds). Prevents clicks when
+/// PolyPan events change pan while the voice is producing audio (common in
+/// mono mode with per-note pan randomization).
+pub(crate) const PAN_RAMP_SECS: f32 = 0.002;
 
 /// Parameters for triggering a note on a voice. Bundles the values needed
 /// by `Voice::note_on()` to avoid excessive function arguments.
@@ -61,9 +53,11 @@ pub struct Voice {
     base_freq: f32,
     /// Per-voice pan position in [-1.0, 1.0]. Updated by PolyPan events.
     pan: f32,
-    /// Cached left/right gains for the current pan position. Avoids
-    /// per-sample sin/cos calls since pan only changes on PolyPan events.
-    pan_gains: PanGains,
+    /// Smoothed left pan gain. Ramps over ~2ms to prevent clicks when pan
+    /// changes while the voice is producing audio.
+    pan_left_smoother: LinearSmoother,
+    /// Smoothed right pan gain. Ramps over ~2ms to prevent clicks.
+    pan_right_smoother: LinearSmoother,
     /// Monotonically increasing counter set on `note_on()`. Used by the voice
     /// allocator to identify the oldest voice for stealing. Zero when idle.
     age: u64,
@@ -71,6 +65,12 @@ pub struct Voice {
 
 impl Default for Voice {
     fn default() -> Self {
+        let (center_left, center_right) = center_pan_gains();
+        let mut pan_left_smoother = LinearSmoother::default();
+        pan_left_smoother.set_immediate(center_left);
+        let mut pan_right_smoother = LinearSmoother::default();
+        pan_right_smoother.set_immediate(center_right);
+
         Self {
             osc: SineOscillator::default(),
             env: ArEnvelope::default(),
@@ -78,7 +78,8 @@ impl Default for Voice {
             note: None,
             base_freq: 0.0,
             pan: 0.0,
-            pan_gains: PanGains::default(),
+            pan_left_smoother,
+            pan_right_smoother,
             age: 0,
         }
     }
@@ -101,12 +102,14 @@ impl Voice {
     }
 
     /// Set the per-voice pan position. Called when a PolyPan event targets
-    /// the note this voice is playing. Pre-computes left/right gains so
-    /// `render_sample()` avoids per-sample trig.
-    pub fn set_pan(&mut self, pan: f32) {
+    /// the note this voice is playing. The new gains are smoothed over ~2ms
+    /// to prevent clicks when pan changes while the voice is producing audio.
+    pub fn set_pan(&mut self, pan: f32, sample_rate: f32) {
         self.pan = pan;
         let (left, right) = apply_constant_power_pan(1.0, pan);
-        self.pan_gains = PanGains { left, right };
+        let ramp_samples = (PAN_RAMP_SECS * sample_rate) as u32;
+        self.pan_left_smoother.set_target(left, ramp_samples);
+        self.pan_right_smoother.set_target(right, ramp_samples);
     }
 
     /// Returns `true` when the voice is silent (envelope idle, no note active).
@@ -181,12 +184,9 @@ impl Voice {
         let velocity = self.velocity_smoother.next_sample();
         let mono_output = osc_sample * env_sample * velocity;
 
-        // Use cached pan gains — avoids sin/cos per sample since pan
-        // only changes on discrete PolyPan events.
-        (
-            mono_output * self.pan_gains.left,
-            mono_output * self.pan_gains.right,
-        )
+        let pan_left = self.pan_left_smoother.next_sample();
+        let pan_right = self.pan_right_smoother.next_sample();
+        (mono_output * pan_left, mono_output * pan_right)
     }
 
     /// Zero all DSP state. Called by `Plugin::reset()`.
@@ -197,7 +197,9 @@ impl Voice {
         self.note = None;
         self.base_freq = 0.0;
         self.pan = 0.0;
-        self.pan_gains = PanGains::default();
+        let (center_left, center_right) = center_pan_gains();
+        self.pan_left_smoother.set_immediate(center_left);
+        self.pan_right_smoother.set_immediate(center_right);
         self.age = 0;
     }
 }
@@ -353,10 +355,16 @@ mod tests {
     fn voice_render_returns_stereo() {
         let mut voice = Voice::default();
         // Use non-zero pan to verify stereo routing.
-        voice.set_pan(1.0); // hard right
+        voice.set_pan(1.0, SR); // hard right
         trigger_voice(&mut voice, A4_NOTE, 1.0, 0.25); // 90° start phase for immediate signal
 
-        // Render a few samples to get past zero crossing.
+        // Render through the pan ramp so gains have settled.
+        let ramp_warmup = (PAN_RAMP_SECS * SR) as usize + 10;
+        for _ in 0..ramp_warmup {
+            voice.render_sample(0.0, SR);
+        }
+
+        // Now measure stereo balance after ramp has completed.
         let mut left_sum = 0.0_f32;
         let mut right_sum = 0.0_f32;
         for _ in 0..50 {
@@ -524,5 +532,60 @@ mod tests {
         // voice_count=2, so only slots 0..2 are searched.
         // Both are active, so steal oldest (index 0, age 1).
         assert_eq!(allocate_voice(&voices, 2), 0);
+    }
+
+    // --- pan smoothing tests ---
+
+    #[test]
+    fn pan_change_is_smoothed() {
+        let mut voice = Voice::default();
+        trigger_voice(&mut voice, A4_NOTE, 1.0, 0.25); // 90° for immediate signal
+
+        // Set pan hard-left and render through the full ramp to settle.
+        voice.set_pan(-1.0, SR);
+        let ramp_samples = (PAN_RAMP_SECS * SR) as usize + 10;
+        for _ in 0..ramp_samples {
+            voice.render_sample(0.0, SR);
+        }
+
+        // Now switch to hard-right. On the very first sample after the change,
+        // the left channel should NOT be zero — it should still be near the old
+        // hard-left gain, proving the pan is smoothed rather than instant.
+        voice.set_pan(1.0, SR);
+        let (left, _right) = voice.render_sample(0.0, SR);
+        assert!(
+            left.abs() > 0.01,
+            "first sample after pan change should not be zero (smoothing), got left={left}"
+        );
+    }
+
+    #[test]
+    fn pan_ramp_completes() {
+        let mut voice = Voice::default();
+        trigger_voice(&mut voice, A4_NOTE, 1.0, 0.25); // 90° for immediate signal
+
+        // Set pan hard-right and render through the full ramp + margin.
+        voice.set_pan(1.0, SR);
+        let ramp_samples = (PAN_RAMP_SECS * SR) as usize + 20;
+        for _ in 0..ramp_samples {
+            voice.render_sample(0.0, SR);
+        }
+
+        // After the ramp completes, left should be ~0 (hard-right pan).
+        let mut left_sum = 0.0_f32;
+        let mut right_sum = 0.0_f32;
+        for _ in 0..50 {
+            let (l, r) = voice.render_sample(0.0, SR);
+            left_sum += l.abs();
+            right_sum += r.abs();
+        }
+        assert!(
+            left_sum < 0.01,
+            "after ramp to hard-right, left should be ~0, got {left_sum}"
+        );
+        assert!(
+            right_sum > 0.1,
+            "after ramp to hard-right, right should have energy, got {right_sum}"
+        );
     }
 }
