@@ -49,13 +49,18 @@ impl Default for SineOne {
     }
 }
 
+/// Gain compensation for polyphonic summing: 1/sqrt(N).
+fn voice_gain(voice_count: usize) -> f32 {
+    1.0 / (voice_count as f32).sqrt()
+}
+
 impl SineOne {
     /// Sync the gain smoother to the current voice-count parameter.
     /// Called from both `initialize()` and `reset()` so that `process()`
     /// always starts with the correct gain level.
     fn sync_voice_gain(&mut self) {
         let voice_count = self.params.voices.value() as usize;
-        self.gain_smoother.set_immediate(1.0 / voice_count as f32);
+        self.gain_smoother.set_immediate(voice_gain(voice_count));
         self.previous_voice_count = voice_count;
     }
 }
@@ -133,7 +138,7 @@ impl Plugin for SineOne {
             self.previous_voice_count = voice_count;
 
             // Smooth gain change over ~5ms to avoid clicks on voice count transitions.
-            let target_gain = 1.0 / voice_count as f32;
+            let target_gain = voice_gain(voice_count);
             let ramp_samples = (0.005 * self.sample_rate) as u32;
             self.gain_smoother.set_target(target_gain, ramp_samples);
         }
@@ -1060,8 +1065,8 @@ mod tests {
 
     #[test]
     fn gain_compensation_scales_output() {
-        // With voices=1 and voices=4, playing the same single note should
-        // produce output that is 4x quieter with voices=4 (gain = 1/4).
+        // With 1/sqrt(N) gain compensation, a single note at voices=4
+        // should be sqrt(4)=2x quieter than at voices=1.
         let mut plugin_1 = init_plugin_with_voices(44100.0, 1);
         let mut plugin_4 = init_plugin_with_voices(44100.0, 4);
 
@@ -1078,7 +1083,6 @@ mod tests {
         let (left_1, _) = run_process(&mut plugin_1, 512, events());
         let (left_4, _) = run_process(&mut plugin_4, 512, events());
 
-        // Compare RMS levels. voices=4 should be ~4x quieter.
         let rms = |samples: &[f32]| -> f32 {
             let sum: f32 = samples.iter().map(|s| s * s).sum();
             (sum / samples.len() as f32).sqrt()
@@ -1087,9 +1091,10 @@ mod tests {
         let rms_4 = rms(&left_4);
         let ratio = rms_1 / rms_4;
 
+        // 1/sqrt(4) = 0.5, so ratio should be ~2.0.
         assert!(
-            (ratio - 4.0).abs() < 0.5,
-            "gain compensation should make voices=4 about 4x quieter, ratio was {ratio}"
+            (ratio - 2.0).abs() < 0.3,
+            "gain compensation should make voices=4 about 2x quieter (1/sqrt(N)), ratio was {ratio}"
         );
     }
 
