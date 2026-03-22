@@ -196,6 +196,13 @@ These are rules specific to nih-plug that are easy to get wrong:
   samples). Do not do this in `Default::default()`.
 - `reset()` must zero all DSP state: oscillator phase, envelope level, envelope state, current
   note, current velocity.
+- `reset()` must also re-initialize any derived state that `initialize()` computes (e.g., gain
+  compensation). The host calls `reset()` after `initialize()`, so anything set in `initialize()`
+  but not re-set in `reset()` will be lost.
+- nih-plug's built-in `Smoother` on `FloatParam` is not initialized in the test harness (always
+  returns 0.0 from `.smoothed.next()`). Use `.value()` for params where testability matters and
+  smoothing is not critical. The `fine_tune` param works with `.smoothed.next()` only because its
+  default (0.0 cents) produces no audible effect.
 - Never allocate in `process()`. The `assert_process_allocs` Cargo feature will abort in debug
   builds if you do.
 
