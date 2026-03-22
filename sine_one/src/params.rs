@@ -2,10 +2,13 @@ use nih_plug::prelude::*;
 
 /// Plugin parameters — user/host-controllable values.
 ///
-/// Three FloatParams that the host (or automation) can control:
+/// Five FloatParams and one IntParam that the host (or automation) can control:
 /// - `fine_tune`: pitch offset in cents (±100 = ±1 semitone)
 /// - `attack`: AR envelope attack time in milliseconds
 /// - `release`: AR envelope release time in milliseconds
+/// - `start_phase`: oscillator phase on NoteOn (0–360°)
+/// - `voices`: polyphonic voice count (1–8)
+/// - `output_gain`: output level in dB (-24 to +12)
 ///
 /// DSP state (oscillator phase, envelope level) does NOT belong here —
 /// it lives on the plugin struct. Params holds only what the user controls.

@@ -40,7 +40,7 @@ stereo field. With no PolyPan event, output defaults to center (equal L/R).
                  ┌─────────────── Voice 0 ───────────────────────┐
 MIDI NoteOn ──►  │ SineOscillator → ArEnvelope → Vel → Pan Gains │──┐
 allocate_voice() └───────────────────────────────────────────────┘  │
-                 ┌─────────────── Voice 1 ───────────────────────┐  ├─► Sum → Gain(1/N) → [L,R]
+                 ┌─────────────── Voice 1 ───────────────────────┐  ├─► Sum → Gain(1/√N) → Output Gain → [L,R]
                  │ SineOscillator → ArEnvelope → Vel → Pan Gains │──┤
                  └───────────────────────────────────────────────┘  │
                  ...up to Voice 7                                   ┘
@@ -169,7 +169,7 @@ gain compensation.
 
 ```
                  ┌─ Voice 0: Osc → Env → Vel → Pan ─┐
-MIDI NoteOn ──►  ├─ Voice 1: Osc → Env → Vel → Pan ─┤──► Sum ──► Gain (1/N) ──► [L, R] out
+MIDI NoteOn ──►  ├─ Voice 1: Osc → Env → Vel → Pan ─┤──► Sum ──► Gain(1/√N) ──► Output Gain ──► [L,R]
                  ├─ Voice 2: ...                     ┤
 allocate_voice() └─ Voice N-1: ...                   ┘
 ```
@@ -193,17 +193,27 @@ musical results (releasing voices are preferentially reclaimed).
 
 ### Gain Compensation
 
-The summed output is divided by the configured voice count:
+The summed output is scaled by `1/√N` (RMS-based compensation), then by the user's output gain:
 
 ```
-gain = 1.0 / voices_param
-output_L = sum_L * gain
-output_R = sum_R * gain
+voice_gain  = 1.0 / sqrt(voices_param)
+output_gain = db_to_gain(output_gain_param)
+output_L    = sum_L * voice_gain * output_gain
+output_R    = sum_R * voice_gain * output_gain
 ```
 
-This means a single note at `Voices=4` is 4× quieter than at `Voices=1`. This is standard
-behavior for polyphonic synthesizers. The gain factor is smoothed over ~5ms via `LinearSmoother`
-to avoid clicks when the `Voices` parameter changes at runtime.
+**Why `1/√N` instead of `1/N`?** Linear `1/N` scaling assumes all voices peak simultaneously
+(worst-case coherent addition). In practice, voices are statistically independent — different
+pitches, phases, and envelope stages make simultaneous peaking unlikely. `1/√N` (RMS-based
+scaling) preserves perceived loudness across voice counts: a single note at `Voices=4` is √4 = 2×
+quieter than at `Voices=1`, not 4×. This is standard practice in polyphonic synthesizers.
+
+The voice gain factor is smoothed over ~5ms via `LinearSmoother` to avoid clicks when the `Voices`
+parameter changes at runtime. Output gain is read once per process block (no smoothing).
+
+**Output Gain attenuverter** (-24 dB to +12 dB, default 0 dB): Provides manual control over the
+final output level. At 0 dB (unity), the plugin's output level is determined entirely by voice gain
+compensation and velocity. Negative values attenuate; positive values amplify (up to +12 dB ≈ 4×).
 
 ### NoteOff Routing
 
@@ -231,6 +241,7 @@ When `Voices` increases: no immediate effect. New slots become available for the
 | Release | `"release"` | `FloatParam` | 1 to 10000 | 300.0 | `None` | ms | Skewed (log-ish feel) |
 | Start Phase | `"start_phase"` | `FloatParam` | 0 to 360 | 0.0 | `None` | ° | Oscillator phase on NoteOn |
 | Voices | `"voices"` | `IntParam` | 1 to 8 | 1 | `None` | — | Polyphonic voice count |
+| Output Gain | `"output_gain"` | `FloatParam` | −24 to +12 | 0.0 | `None` | dB | Attenuverter; read per-block |
 
 **Notes on smoothing choices:**
 - `Fine Tune` uses `Linear(20ms)` so pitch slides smoothly when automated (avoids zipper noise).
@@ -252,7 +263,7 @@ the display name on purpose.
 
 ## State & Preset Design
 
-All plugin state is captured by the five `Params` fields — no custom serialization needed. When
+All plugin state is captured by the six `Params` fields — no custom serialization needed. When
 the DAW saves a project or preset, nih-plug serializes the `Params` struct automatically via the
 `#[derive(Params)]` macro.
 
@@ -278,7 +289,7 @@ sine-one/
     └── src/
         ├── lib.rs          # nih_export_clap!(plugin::SineOne); re-exports
         ├── plugin.rs       # SineOne struct + Plugin trait impl (process, initialize, reset)
-        ├── params.rs       # SineOneParams struct with four FloatParams + one IntParam
+        ├── params.rs       # SineOneParams struct with five FloatParams + one IntParam
         ├── dsp/
         │   ├── mod.rs      # pub mod oscillator; envelope; pan; smoother; voice;
         │   ├── oscillator.rs   # SineOscillator: phase, set_frequency(), next_sample(), reset()
@@ -567,8 +578,8 @@ cargo run -p sine_one --features standalone -- --output "Built-in Output"
 ### Bitwig Smoke Tests (manual, after install)
 
 1. **Plugin loads** — appears in Bitwig browser under Instruments
-2. **Parameters visible** — Fine Tune, Attack, Release, Start Phase appear in the device panel with
-   correct ranges and units
+2. **Parameters visible** — Fine Tune, Attack, Release, Start Phase, Voices, Output Gain appear in
+   the device panel with correct ranges and units
 3. **Note produces sound** — draw a MIDI note; hear a sine tone
 4. **AR envelope audible** — set Attack to 500ms; note should fade in; set Release to 1000ms;
    note should fade out after key release
