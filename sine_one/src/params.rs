@@ -30,6 +30,12 @@ pub struct SineOneParams {
     /// Value is read at note-off boundaries, not per-sample — no smoothing needed.
     #[id = "release"]
     pub release: FloatParam,
+
+    /// Oscillator start phase in degrees (0–360).
+    /// Read at note-on boundaries to set the oscillator phase — no smoothing needed.
+    /// 0° = sin(0) = 0.0 (cleanest sine start); 90° = sin(π/2) = 1.0 (peak).
+    #[id = "start_phase"]
+    pub start_phase: FloatParam,
 }
 
 impl Default for SineOneParams {
@@ -74,7 +80,39 @@ impl Default for SineOneParams {
             )
             .with_unit(" ms")
             .with_step_size(0.1),
+
+            start_phase: Self::build_start_phase(0.0),
         }
+    }
+}
+
+impl SineOneParams {
+    /// Build the start_phase FloatParam with the given default value.
+    /// Shared between `Default` and the test helper to avoid duplicating
+    /// range, unit, and step_size definitions.
+    fn build_start_phase(default_degrees: f32) -> FloatParam {
+        FloatParam::new(
+            "Start Phase",
+            default_degrees,
+            FloatRange::Linear {
+                min: 0.0,
+                max: 360.0,
+            },
+        )
+        .with_unit(" °")
+        .with_step_size(1.0)
+    }
+}
+
+#[cfg(test)]
+impl SineOneParams {
+    /// Create params with a custom start_phase default for testing.
+    /// Works around nih-plug's `ParamMut` being `pub(crate)` by constructing
+    /// the `FloatParam` with the desired value baked in as the default.
+    pub fn with_start_phase(degrees: f32) -> Self {
+        let mut params = Self::default();
+        params.start_phase = Self::build_start_phase(degrees);
+        params
     }
 }
 
@@ -111,6 +149,14 @@ mod tests {
             "release default {release_val} out of range"
         );
         assert_eq!(release_val, 300.0, "release default should be 300.0 ms");
+
+        // Start Phase: range 0..360 degrees, default 0.0
+        let sp_val = params.start_phase.value();
+        assert!(
+            (0.0..=360.0).contains(&sp_val),
+            "start_phase default {sp_val} out of range"
+        );
+        assert_eq!(sp_val, 0.0, "start_phase default should be 0.0 degrees");
     }
 
     /// Verify that default values survive a normalize→unnormalize round-trip.
@@ -143,6 +189,14 @@ mod tests {
             (rel_plain - 300.0).abs() < 0.1,
             "release round-trip: expected 300.0, got {rel_plain}"
         );
+
+        // Start Phase: Linear range, should round-trip exactly.
+        let sp_norm = params.start_phase.preview_normalized(0.0);
+        let sp_plain = params.start_phase.preview_plain(sp_norm);
+        assert!(
+            (sp_plain - 0.0).abs() < 0.01,
+            "start_phase round-trip: expected 0.0, got {sp_plain}"
+        );
     }
 
     /// Verify that the normalized default values reported to the CLAP host
@@ -170,6 +224,13 @@ mod tests {
         assert!(
             rel_norm > 0.3 && rel_norm < 0.5,
             "release normalized default: expected ~0.416, got {rel_norm}"
+        );
+
+        // Start Phase: Linear 0..360, default 0.0 → normalized 0.0.
+        let sp_norm = params.start_phase.default_normalized_value();
+        assert!(
+            sp_norm.abs() < 1e-6,
+            "start_phase normalized default: expected 0.0, got {sp_norm}"
         );
     }
 }

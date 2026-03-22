@@ -126,6 +126,11 @@ impl Plugin for SineOne {
                         // recomputing midi_note_to_freq every sample.
                         self.current_base_freq = util::midi_note_to_freq(note);
 
+                        // Convert start_phase from degrees (0–360) to normalized [0, 1).
+                        // The % 1.0 maps 360° to 0.0 (same position).
+                        let start_phase_normalized = self.params.start_phase.value() / 360.0 % 1.0;
+                        self.oscillator.set_phase(start_phase_normalized);
+
                         // Read attack time from params and trigger the envelope.
                         self.envelope
                             .set_attack(self.params.attack.value(), self.sample_rate);
@@ -273,9 +278,8 @@ mod tests {
         fn set_current_voice_capacity(&self, _capacity: u32) {}
     }
 
-    /// Helper: construct a plugin and call initialize() with the given sample rate.
-    fn init_plugin(sample_rate: f32) -> SineOne {
-        let mut plugin = SineOne::default();
+    /// Helper: call initialize() on a plugin instance with the given sample rate.
+    fn initialize_plugin(mut plugin: SineOne, sample_rate: f32) -> SineOne {
         let layout = SineOne::AUDIO_IO_LAYOUTS[0];
         let config = BufferConfig {
             sample_rate,
@@ -286,6 +290,20 @@ mod tests {
         let result = plugin.initialize(&layout, &config, &mut MockInitContext);
         assert!(result, "initialize() should return true");
         plugin
+    }
+
+    /// Helper: construct a default plugin and call initialize().
+    fn init_plugin(sample_rate: f32) -> SineOne {
+        initialize_plugin(SineOne::default(), sample_rate)
+    }
+
+    /// Helper: construct a plugin with a custom start_phase and call initialize().
+    fn init_plugin_with_start_phase(sample_rate: f32, degrees: f32) -> SineOne {
+        let plugin = SineOne {
+            params: Arc::new(SineOneParams::with_start_phase(degrees)),
+            ..SineOne::default()
+        };
+        initialize_plugin(plugin, sample_rate)
     }
 
     /// Helper: call `process()` on the plugin with a stereo buffer of the given
@@ -650,6 +668,109 @@ mod tests {
         assert!(
             left.iter().all(|&s| s.abs() < 1e-6),
             "left channel should be silent when pan is hard-right"
+        );
+    }
+
+    #[test]
+    fn note_on_resets_phase_to_zero() {
+        let mut plugin = init_plugin(44100.0);
+
+        // First NoteOn: capture first 64 samples of output.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        let (first_left, _) = run_process(&mut plugin, 64, events);
+
+        // Advance 200 samples to move the oscillator phase forward.
+        run_process(&mut plugin, 200, vec![]);
+
+        // NoteOff and let release complete.
+        let events = vec![NoteEvent::NoteOff {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 0.0,
+        }];
+        run_process(&mut plugin, 20000, events);
+
+        // Second NoteOn: capture first 64 samples.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        let (second_left, _) = run_process(&mut plugin, 64, events);
+
+        // Both NoteOns should produce identical output (deterministic phase).
+        assert_eq!(
+            first_left, second_left,
+            "two NoteOns should produce identical output when phase is retriggered"
+        );
+    }
+
+    #[test]
+    fn note_on_with_90_degree_start_phase() {
+        let mut plugin_0 = init_plugin(44100.0);
+        let mut plugin_90 = init_plugin_with_start_phase(44100.0, 90.0);
+
+        let events = || {
+            vec![NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            }]
+        };
+
+        let (left_0, _) = run_process(&mut plugin_0, 64, events());
+        let (left_90, _) = run_process(&mut plugin_90, 64, events());
+
+        // The outputs should differ because the oscillator starts at different phases.
+        assert_ne!(
+            left_0, left_90,
+            "0° and 90° start phase should produce different output"
+        );
+    }
+
+    #[test]
+    fn retrigger_resets_phase() {
+        let mut plugin = init_plugin(44100.0);
+
+        // First NoteOn.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        run_process(&mut plugin, 200, events);
+
+        // Second NoteOn (retrigger, no NoteOff).
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        let (retrigger_left, _) = run_process(&mut plugin, 32, events);
+
+        // Phase resets to 0 on retrigger. sin(0) = 0, so the first sample's
+        // oscillator contribution is zero regardless of envelope level.
+        // output[0] = sin(0) * envelope * velocity = 0.
+        assert!(
+            retrigger_left[0].abs() < 1e-6,
+            "first sample after retrigger should be ~0 (sin(0) = 0), got {}",
+            retrigger_left[0]
         );
     }
 }

@@ -88,13 +88,13 @@ State transition rules:
 - **Release**: decrements `level` by `current_level_at_release_start / release_samples` per sample
   (linear ramp from wherever the envelope currently is, to zero, over `release_samples`); when
   `level ≤ 0` → `Idle`
-- **Idle**: outputs 0.0; oscillator phase continues advancing (so it's in a reasonable position
-  on retrigger — no click from a phase discontinuity)
+- **Idle**: outputs 0.0
 
-**Why not reset oscillator phase on NoteOn?** For a sine wave, resetting phase to 0 on every
-NoteOn can cause a click if the previous sample wasn't near zero. Letting the phase run freely
-is safe for a sine and avoids this. (Contrast: for a saw or square, you'd reset to minimize
-transients.)
+**Phase retrigger on NoteOn:** The oscillator phase is reset to a configurable start position
+(default 0° = sin(0) = 0.0) on every NoteOn. This ensures deterministic transients and eliminates
+clicks from random phase positions when the envelope attack begins. The `start_phase` parameter
+(0–360°) allows choosing the initial waveform position — 0° is the cleanest sine start, while
+90° starts at the peak for a more aggressive transient.
 
 ### Velocity Scaling
 
@@ -149,6 +149,7 @@ with one voice — strict note matching would drop events that arrive before Not
 | Fine Tune | `"fine_tune"` | `FloatParam` | −100 to +100 | 0.0 | `Linear(20ms)` | cents | ±1 semitone |
 | Attack | `"attack"` | `FloatParam` | 1 to 5000 | 10.0 | `None` | ms | Skewed (log-ish feel) |
 | Release | `"release"` | `FloatParam` | 1 to 10000 | 300.0 | `None` | ms | Skewed (log-ish feel) |
+| Start Phase | `"start_phase"` | `FloatParam` | 0 to 360 | 0.0 | `None` | ° | Oscillator phase on NoteOn |
 
 **Notes on smoothing choices:**
 - `Fine Tune` uses `Linear(20ms)` so pitch slides smoothly when automated (avoids zipper noise).
@@ -488,8 +489,8 @@ cargo run -p sine_one --features standalone -- --output "Built-in Output"
 ### Bitwig Smoke Tests (manual, after install)
 
 1. **Plugin loads** — appears in Bitwig browser under Instruments
-2. **Parameters visible** — Fine Tune, Attack, Release appear in the device panel with correct
-   ranges and units
+2. **Parameters visible** — Fine Tune, Attack, Release, Start Phase appear in the device panel with
+   correct ranges and units
 3. **Note produces sound** — draw a MIDI note; hear a sine tone
 4. **AR envelope audible** — set Attack to 500ms; note should fade in; set Release to 1000ms;
    note should fade out after key release
@@ -528,10 +529,9 @@ Make it executable: `chmod +x .git/hooks/pre-commit`
    A quadratic or logarithmic curve (`velocity^2 / 127^2`) often feels more natural on keyboards.
    Leave linear for now; easy to change in one place later.
 
-3. **Phase initialization**: Oscillator phase starts at 0 on plugin load. On the very first note,
-   the sine starts at 0 (silent) which is fine — the attack ramp covers any transient. On retrigger
-   the phase is wherever it left off, which avoids phase discontinuity. This is the correct
-   behavior; document here in case it looks like a bug.
+3. **~~Phase initialization~~** *(resolved)*: The oscillator phase is now reset to a configurable
+   `start_phase` parameter (0–360°, default 0°) on every NoteOn. This ensures deterministic
+   transients and eliminates clicks from random phase positions.
 
 4. **~~Mono vs. stereo output layout~~** *(resolved)*: The plugin now applies constant-power
    panning via `PolyPan` note expression events. At center pan (default), both channels carry

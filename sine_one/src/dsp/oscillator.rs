@@ -44,6 +44,16 @@ impl SineOscillator {
         sample
     }
 
+    /// Set the phase accumulator to an arbitrary position in [0, 1).
+    /// Used to retrigger the oscillator at a configurable start phase on NoteOn.
+    pub fn set_phase(&mut self, phase: f32) {
+        debug_assert!(
+            (0.0..1.0).contains(&phase),
+            "phase ({phase}) must be in [0.0, 1.0)"
+        );
+        self.phase = phase;
+    }
+
     /// Zero the phase accumulator. Called by `Plugin::reset()` to return the
     /// oscillator to a known state.
     pub fn reset(&mut self) {
@@ -154,6 +164,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn set_phase_zero_matches_reset() {
+        let mut osc_a = SineOscillator::default();
+        osc_a.set_frequency(440.0, 44100.0);
+        // Advance past zero.
+        for _ in 0..50 {
+            osc_a.next_sample();
+        }
+        osc_a.set_phase(0.0);
+
+        let mut osc_b = SineOscillator::default();
+        osc_b.set_frequency(440.0, 44100.0);
+        osc_b.reset();
+
+        assert_eq!(osc_a.next_sample(), osc_b.next_sample());
+    }
+
+    #[test]
+    fn set_phase_quarter_starts_at_peak() {
+        let mut osc = SineOscillator::default();
+        osc.set_frequency(440.0, 44100.0);
+        // Phase 0.25 → sin(0.25 * 2π) = sin(π/2) = 1.0
+        osc.set_phase(0.25);
+        let sample = osc.next_sample();
+        assert!(
+            (sample - 1.0).abs() < 1e-6,
+            "expected ~1.0 at phase 0.25, got {sample}"
+        );
+    }
+
+    #[test]
+    fn set_phase_half_starts_at_zero_crossing() {
+        let mut osc = SineOscillator::default();
+        osc.set_frequency(440.0, 44100.0);
+        // Phase 0.5 → sin(0.5 * 2π) = sin(π) ≈ 0.0
+        osc.set_phase(0.5);
+        let sample = osc.next_sample();
+        assert!(
+            sample.abs() < 1e-6,
+            "expected ~0.0 at phase 0.5, got {sample}"
+        );
+    }
+
     proptest! {
         #[test]
         fn sine_is_always_finite(freq in 20.0f32..20000.0, sr in 22050.0f32..192000.0) {
@@ -162,6 +215,16 @@ mod tests {
             for _ in 0..512 {
                 prop_assert!(osc.next_sample().is_finite());
             }
+        }
+
+        #[test]
+        fn set_phase_output_in_range(phase in 0.0f32..1.0, freq in 20.0f32..20000.0, sr in 22050.0f32..192000.0) {
+            let mut osc = SineOscillator::default();
+            osc.set_frequency(freq, sr);
+            osc.set_phase(phase);
+            let sample = osc.next_sample();
+            prop_assert!(sample.is_finite());
+            prop_assert!((-1.0..=1.0).contains(&sample));
         }
     }
 }
