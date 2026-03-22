@@ -65,11 +65,16 @@ impl ArEnvelope {
     /// Trigger the attack phase. Preserves the current level so retrigger
     /// during release produces a smooth ramp rather than an audible dip to zero.
     pub fn note_on(&mut self) {
-        // Compute increment from the remaining distance to 1.0 so that
-        // retrigger from a non-zero level still takes the full attack
-        // duration, producing a gentler slope instead of a truncated ramp.
-        // When level is already at 1.0, remaining is 0.0 and the increment
-        // becomes 0.0 — next_sample() will clamp and hold at 1.0.
+        self.note_on_at_level(self.level);
+    }
+
+    /// Trigger the attack phase with an explicit initial level.
+    ///
+    /// Sets the envelope level to `initial_level` (clamped to [0.0, 1.0]) and
+    /// enters Attack, ramping from that level to 1.0 over the configured attack
+    /// duration. Contrast with `note_on()`, which preserves the current level.
+    pub fn note_on_at_level(&mut self, initial_level: f32) {
+        self.level = initial_level.clamp(0.0, 1.0);
         let remaining = (1.0 - self.level).max(0.0);
         self.attack_increment = remaining / self.attack_samples;
         self.state = EnvState::Attack;
@@ -509,6 +514,84 @@ mod tests {
         assert!(
             env.is_idle(),
             "envelope should be idle after release completes"
+        );
+    }
+
+    // --- note_on_at_level tests ---
+
+    #[test]
+    fn note_on_at_level_sets_initial_level() {
+        let mut env = make_envelope(10.0, 100.0);
+        env.note_on_at_level(0.5);
+
+        // First next_sample() should return ~0.5 + one attack increment.
+        // Remaining distance = 1.0 - 0.5 = 0.5, increment = 0.5 / 441.
+        let sample = env.next_sample();
+        let expected_increment = 0.5 / (10.0 * TEST_SAMPLE_RATE / 1000.0);
+        let expected = 0.5 + expected_increment;
+        assert!(
+            (sample - expected).abs() < 1e-6,
+            "first sample should be ~{expected}, got {sample}"
+        );
+    }
+
+    #[test]
+    fn note_on_at_level_zero_matches_note_on() {
+        let mut env_a = make_envelope(10.0, 100.0);
+        let mut env_b = make_envelope(10.0, 100.0);
+
+        env_a.note_on();
+        env_b.note_on_at_level(0.0);
+
+        // Both should produce identical output for the full attack phase.
+        let attack_samples = ms_to_samples(10.0);
+        for i in 0..attack_samples + 10 {
+            let a = env_a.next_sample();
+            let b = env_b.next_sample();
+            assert!(
+                (a - b).abs() < 1e-6,
+                "sample {i}: note_on ({a}) and note_on_at_level(0.0) ({b}) should match"
+            );
+        }
+    }
+
+    #[test]
+    fn note_on_at_level_one_holds_at_one() {
+        let mut env = make_envelope(10.0, 100.0);
+        env.note_on_at_level(1.0);
+
+        // Already at target — increment should be 0, level holds at 1.0.
+        for i in 0..100 {
+            let sample = env.next_sample();
+            assert!(
+                (sample - 1.0).abs() < 1e-6,
+                "sample {i}: should hold at 1.0, got {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn note_on_at_level_clamps_input() {
+        let mut env = make_envelope(10.0, 100.0);
+
+        // Value > 1.0 should be clamped to 1.0.
+        env.note_on_at_level(2.0);
+        let sample = env.next_sample();
+        assert!(
+            (sample - 1.0).abs() < 1e-6,
+            "level > 1.0 should be clamped, got {sample}"
+        );
+
+        // Reset and test value < 0.0 — should be clamped to 0.0.
+        env.reset();
+        env.set_attack(10.0, TEST_SAMPLE_RATE);
+        env.note_on_at_level(-1.0);
+        let sample = env.next_sample();
+        // Should behave like note_on_at_level(0.0): first sample = 0 + increment.
+        let expected_increment = 1.0 / (10.0 * TEST_SAMPLE_RATE / 1000.0);
+        assert!(
+            (sample - expected_increment).abs() < 1e-6,
+            "level < 0.0 should be clamped to 0.0, got {sample}"
         );
     }
 
