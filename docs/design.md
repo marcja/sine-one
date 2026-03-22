@@ -100,8 +100,14 @@ State transition rules:
 
 **Phase retrigger on NoteOn:** Phase reset behavior depends on context:
 
-- **From silence** (envelope Idle): phase always resets to `start_phase`. The attack envelope
-  ramps from zero, so no click occurs at any start phase.
+- **From silence** (envelope Idle): phase resets to `start_phase`. When the attack time is short
+  (< 10 ms), the envelope's initial level is set to `|sin(start_phase × 2π)| × gate`, where
+  `gate` linearly scales from 1.0 at the minimum attack (1 ms) to 0.0 at 10 ms. This creates an
+  amplitude discontinuity proportional to both the waveform value at that phase and the attack
+  speed — the intentional "click" that `start_phase` controls. At 0° the initial level is always
+  0.0 (smooth, `sin(0) = 0`). At 90° with a 1 ms attack, the initial level is 1.0 (maximum
+  transient — first sample at full amplitude). Long attacks (≥ 10 ms) suppress the transient
+  entirely, preserving the intended swell. The attack then ramps from the initial level to 1.0.
 - **Retrigger at 0° start phase**: phase continues from its current position. Since `sin(0) = 0`,
   a hard reset would create a waveform dip to zero (audible click). Phase continuity avoids this,
   giving a smooth retrigger. Velocity ramps over ~2ms via `LinearSmoother`.
@@ -109,8 +115,9 @@ State transition rules:
   transient whose magnitude scales with `sin(start_phase)`. This is the desired "click" character
   that `start_phase` controls — 0° = smooth, 90° = maximum punch. Velocity jumps immediately.
 
-The `start_phase` parameter (0–360°) thus serves double duty: it sets the initial waveform
-position for notes from silence, and controls the retrigger transient character during performance.
+The `start_phase` parameter (0–360°) thus serves double duty: it controls the initial waveform
+position and transient character for notes from silence, and the retrigger transient during
+performance.
 
 ### Velocity Scaling
 
