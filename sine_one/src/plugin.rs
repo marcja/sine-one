@@ -3,34 +3,30 @@ use std::sync::Arc;
 
 use nih_plug::prelude::*;
 
-use crate::dsp::envelope::ArEnvelope;
-use crate::dsp::oscillator::SineOscillator;
-use crate::dsp::smoother::LinearSmoother;
+use crate::dsp::voice::{NoteOnParams, Voice, MAX_VOICES};
 use crate::params::SineOneParams;
 
-/// A minimal monophonic sine-wave synthesizer CLAP plugin.
+/// A polyphonic sine-wave synthesizer CLAP plugin.
 ///
 /// DSP state lives here on the plugin struct, NOT in Params. Params holds
 /// only what the user/host controls; DSP state is ephemeral and not persisted.
+///
+/// Voice state is stored in a fixed-size array of `Voice` structs. The `voices`
+/// parameter controls how many slots are active (1–8). When `voices=1`, the
+/// plugin behaves identically to its original monophonic design.
 pub struct SineOne {
     params: Arc<SineOneParams>,
 
     /// Cached sample rate from the last `initialize()` call.
     sample_rate: f32,
-    oscillator: SineOscillator,
-    envelope: ArEnvelope,
-    /// Currently held MIDI note number, or `None` if no note is active.
-    current_note: Option<u8>,
-    /// Smoothed velocity for the current note. On retrigger, ramps over ~2ms
-    /// to avoid a gain discontinuity. On first note from silence, jumps
-    /// immediately (the attack envelope handles the fade-in).
-    velocity_smoother: LinearSmoother,
-    /// Cached base frequency (Hz) for the current note, before fine-tune.
-    /// Stored to avoid recomputing `midi_note_to_freq` every sample.
-    current_base_freq: f32,
-    /// Current pan position in [-1.0, 1.0]. Updated by PolyPan events.
-    /// -1.0 = hard left, 0.0 = center, 1.0 = hard right.
-    current_pan: f32,
+    /// Fixed-size array of voice slots. Only `voices[0..voice_count]` are
+    /// used for allocation; voices beyond that count are not assigned new
+    /// notes but may still produce sound while their envelopes release.
+    voices: [Voice; MAX_VOICES],
+    /// Monotonically increasing counter for voice age tracking. Bumped on
+    /// each `note_on()` and assigned to the voice, so the allocator can
+    /// identify the oldest voice for stealing.
+    next_voice_age: u64,
 }
 
 impl Default for SineOne {
@@ -38,12 +34,8 @@ impl Default for SineOne {
         Self {
             params: Arc::new(SineOneParams::default()),
             sample_rate: 0.0,
-            oscillator: SineOscillator::default(),
-            envelope: ArEnvelope::default(),
-            current_note: None,
-            velocity_smoother: LinearSmoother::default(),
-            current_base_freq: 0.0,
-            current_pan: 0.0,
+            voices: core::array::from_fn(|_| Voice::default()),
+            next_voice_age: 0,
         }
     }
 }
@@ -82,25 +74,15 @@ impl Plugin for SineOne {
         // Cache sample rate for use in process() when computing frequencies
         // and envelope times from parameter values.
         self.sample_rate = buffer_config.sample_rate;
-
-        // Pre-compute envelope times from current parameter values so the
-        // envelope is ready before the first note-on event arrives.
-        self.envelope
-            .set_attack(self.params.attack.value(), self.sample_rate);
-        self.envelope
-            .set_release(self.params.release.value(), self.sample_rate);
-
         true
     }
 
     fn reset(&mut self) {
         // Zero all DSP state so the plugin starts from silence.
-        self.oscillator.reset();
-        self.envelope.reset();
-        self.current_note = None;
-        self.velocity_smoother.reset();
-        self.current_base_freq = 0.0;
-        self.current_pan = 0.0;
+        for voice in &mut self.voices {
+            voice.reset();
+        }
+        self.next_voice_age = 0;
     }
 
     fn process(
@@ -111,6 +93,10 @@ impl Plugin for SineOne {
     ) -> ProcessStatus {
         let mut next_event = context.next_event();
 
+        // For this monophonic-compatible refactor, all events route to voices[0].
+        // The full polyphonic allocator is wired in a subsequent commit.
+        let voice = &mut self.voices[0];
+
         for (sample_idx, mut channel_samples) in buffer.iter_samples().enumerate() {
             // Handle all MIDI events scheduled at this sample.
             while let Some(event) = next_event {
@@ -120,68 +106,36 @@ impl Plugin for SineOne {
 
                 match event {
                     NoteEvent::NoteOn { note, velocity, .. } => {
-                        self.current_note = Some(note);
-
-                        // Cache the base frequency for this note. The per-sample loop
-                        // applies fine-tune on top of this each sample, so we avoid
-                        // recomputing midi_note_to_freq every sample.
-                        self.current_base_freq = util::midi_note_to_freq(note);
-
                         // Convert start_phase from degrees (0–360) to normalized [0, 1).
                         let start_phase_normalized = self.params.start_phase.value() / 360.0 % 1.0;
 
-                        // Phase reset and velocity strategy depend on context:
-                        //
-                        // - From silence (idle): always reset phase and jump velocity.
-                        //   The attack envelope handles the fade-in.
-                        //
-                        // - Retrigger at 0° start phase: skip phase reset (sin(0) = 0
-                        //   would create a waveform dip to zero → click). Phase continues
-                        //   from current position. Velocity ramps over ~2ms.
-                        //
-                        // - Retrigger at non-zero start phase: reset phase to create an
-                        //   intentional transient whose magnitude scales with
-                        //   sin(start_phase). This is the desired "click" character
-                        //   that start_phase controls. Velocity jumps immediately.
-                        let smooth_retrigger =
-                            !self.envelope.is_idle() && start_phase_normalized == 0.0;
-
-                        if smooth_retrigger {
-                            // 0° retrigger: phase continues, velocity ramps.
-                            let ramp_samples = (0.002 * self.sample_rate) as u32;
-                            self.velocity_smoother.set_target(velocity, ramp_samples);
-                        } else {
-                            // From silence or non-zero start phase: reset phase
-                            // and jump velocity.
-                            self.oscillator.set_phase(start_phase_normalized);
-                            self.velocity_smoother.set_immediate(velocity);
-                        }
-
-                        // Read attack time from params and trigger the envelope.
-                        self.envelope
-                            .set_attack(self.params.attack.value(), self.sample_rate);
-                        self.envelope.note_on();
+                        self.next_voice_age += 1;
+                        voice.note_on(NoteOnParams {
+                            note,
+                            velocity,
+                            base_freq: util::midi_note_to_freq(note),
+                            start_phase_normalized,
+                            sample_rate: self.sample_rate,
+                            attack_ms: self.params.attack.value(),
+                            age: self.next_voice_age,
+                        });
                     }
                     NoteEvent::NoteOff { note, .. } => {
                         // Only respond to NoteOff for the currently held note.
-                        if self.current_note == Some(note) {
-                            self.envelope
-                                .set_release(self.params.release.value(), self.sample_rate);
-                            self.envelope.note_off();
-                            self.current_note = None;
+                        if voice.note() == Some(note) {
+                            voice.note_off(self.params.release.value(), self.sample_rate);
                         }
                     }
                     // NOTE(poly_pan): We accept all PolyPan events regardless of the
-                    //   note field. This is a monophonic synth with one voice, and
-                    //   PolyPan may arrive before NoteOn in the same buffer (e.g., from
-                    //   Bitwig's Randomize device). Strict note matching would drop
-                    //   those events.
+                    //   note field. With voices=1, PolyPan may arrive before NoteOn in
+                    //   the same buffer (e.g., from Bitwig's Randomize device). Strict
+                    //   note matching would drop those events.
                     // REVIEW(pan_smoothing): Pan changes apply instantly at the sample
                     //   they arrive. If continuous pan automation causes audible zipper
                     //   noise, add a one-pole smoother here. Unlikely for per-note pan
                     //   from Bitwig's Randomize device.
                     NoteEvent::PolyPan { pan, .. } => {
-                        self.current_pan = pan;
+                        voice.set_pan(pan);
                     }
                     _ => (),
                 }
@@ -194,22 +148,9 @@ impl Plugin for SineOne {
             // consumed every sample even when no note is active.
             let fine_tune_cents = self.params.fine_tune.smoothed.next();
 
-            // Update oscillator frequency per-sample when a note is active.
-            if self.current_note.is_some() {
-                let freq =
-                    crate::dsp::oscillator::apply_detune(self.current_base_freq, fine_tune_cents);
-                self.oscillator.set_frequency(freq, self.sample_rate);
-            }
-
-            // Generate audio: oscillator × envelope × smoothed velocity.
-            let osc_sample = self.oscillator.next_sample();
-            let env_sample = self.envelope.next_sample();
-            let velocity = self.velocity_smoother.next_sample();
-            let mono_output = osc_sample * env_sample * velocity;
-
-            // Apply constant-power stereo panning.
+            // Generate audio from voice and write to stereo output.
             let (left_sample, right_sample) =
-                crate::dsp::pan::apply_constant_power_pan(mono_output, self.current_pan);
+                voice.render_sample(fine_tune_cents, self.sample_rate);
 
             // Write to stereo output. AUDIO_IO_LAYOUTS guarantees exactly 2 channels.
             let mut channels = channel_samples.iter_mut();
@@ -381,64 +322,33 @@ mod tests {
     }
 
     #[test]
-    fn reset_zeros_oscillator() {
+    fn reset_zeros_all_voices() {
         let mut plugin = init_plugin(44100.0);
 
-        // Dirty the oscillator by setting a frequency and advancing samples.
-        plugin.oscillator.set_frequency(440.0, 44100.0);
-        for _ in 0..50 {
-            plugin.oscillator.next_sample();
+        // Trigger a note to dirty voice state, then reset.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        run_process(&mut plugin, 100, events);
+
+        plugin.reset();
+
+        // After reset, all voices should be idle and produce silence.
+        for (i, voice) in plugin.voices.iter().enumerate() {
+            assert!(voice.is_idle(), "voice {i} should be idle after reset");
         }
-
-        plugin.reset();
-
-        // After reset, oscillator should behave identically to a fresh one.
-        let mut fresh = SineOscillator::default();
-        fresh.set_frequency(440.0, 44100.0);
-        plugin.oscillator.set_frequency(440.0, 44100.0);
-        assert_eq!(plugin.oscillator.next_sample(), fresh.next_sample());
-    }
-
-    #[test]
-    fn reset_zeros_envelope() {
-        let mut plugin = init_plugin(44100.0);
-
-        // Trigger the envelope so it's in a non-idle state.
-        plugin.envelope.set_attack(10.0, 44100.0);
-        plugin.envelope.note_on();
-        for _ in 0..100 {
-            plugin.envelope.next_sample();
-        }
-
-        plugin.reset();
-
-        // After reset, envelope should output 0.0 (Idle).
-        assert_eq!(plugin.envelope.next_sample(), 0.0);
-    }
-
-    #[test]
-    fn reset_clears_note_and_velocity() {
-        let mut plugin = init_plugin(44100.0);
-
-        // Simulate a note being active.
-        plugin.current_note = Some(69);
-        plugin.velocity_smoother.set_immediate(100.0 / 127.0);
-        plugin.current_base_freq = 440.0;
-
-        plugin.reset();
-
-        assert_eq!(
-            plugin.current_note, None,
-            "current_note should be None after reset"
+        let (left, right) = run_process(&mut plugin, 64, vec![]);
+        assert!(
+            left.iter().all(|&s| s == 0.0),
+            "should produce silence after reset"
         );
-        assert_eq!(
-            plugin.velocity_smoother.next_sample(),
-            0.0,
-            "velocity smoother should output 0.0 after reset"
-        );
-        assert_eq!(
-            plugin.current_base_freq, 0.0,
-            "current_base_freq should be 0.0 after reset"
+        assert!(
+            right.iter().all(|&s| s == 0.0),
+            "should produce silence after reset"
         );
     }
 
@@ -655,14 +565,36 @@ mod tests {
     fn reset_clears_pan() {
         let mut plugin = init_plugin(44100.0);
 
-        // Set a non-default pan value, then reset.
-        plugin.current_pan = 0.5;
+        // Set a non-default pan via PolyPan event, then reset.
+        let events = vec![
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            },
+            NoteEvent::PolyPan {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                pan: 0.5,
+            },
+        ];
+        run_process(&mut plugin, 64, events);
         plugin.reset();
 
-        assert_eq!(
-            plugin.current_pan, 0.0,
-            "current_pan should be 0.0 after reset"
-        );
+        // After reset, pan should be centered — verify by checking equal L/R output.
+        let events = vec![NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 69,
+            velocity: 1.0,
+        }];
+        let (left, right) = run_process(&mut plugin, 64, events);
+        assert_eq!(left, right, "after reset, pan should be centered (L == R)");
     }
 
     #[test]
