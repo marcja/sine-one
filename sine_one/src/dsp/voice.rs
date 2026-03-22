@@ -195,6 +195,51 @@ impl Voice {
     }
 }
 
+/// Find the best voice slot to assign for a new note.
+///
+/// Allocation priority:
+/// 1. First idle voice (no stealing needed)
+/// 2. Oldest voice in Release state (already fading out — least disruptive steal)
+/// 3. Oldest voice in Attack/hold state (last resort)
+///
+/// "Oldest" means lowest `age` value (age is a monotonic counter incremented
+/// on each `note_on()`).
+///
+/// `voice_count` limits the search to `voices[0..voice_count]`, allowing the
+/// plugin to dynamically reduce polyphony without resizing the array.
+///
+/// # Panics
+/// Panics if `voice_count` is 0 or exceeds `voices.len()`.
+pub fn allocate_voice(voices: &[Voice], voice_count: usize) -> usize {
+    assert!(voice_count > 0 && voice_count <= voices.len());
+
+    // 1. First idle voice — no stealing needed.
+    for (i, voice) in voices[..voice_count].iter().enumerate() {
+        if voice.is_idle() {
+            return i;
+        }
+    }
+
+    // 2. Oldest releasing voice (lowest age among Release-state voices).
+    let oldest_releasing = voices[..voice_count]
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_releasing())
+        .min_by_key(|(_, v)| v.age());
+
+    if let Some((i, _)) = oldest_releasing {
+        return i;
+    }
+
+    // 3. Oldest active voice (lowest age among all voices — last resort).
+    voices[..voice_count]
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, v)| v.age())
+        .map(|(i, _)| i)
+        .expect("voice_count > 0 guarantees at least one voice")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +432,89 @@ mod tests {
             (vel - 1.0).abs() < 1e-6,
             "velocity should jump on non-zero start phase retrigger, got {vel}"
         );
+    }
+
+    // --- allocate_voice tests ---
+
+    /// Helper: make a voice active with a given age by triggering note_on.
+    fn make_active_voice(age: u64, note: u8) -> Voice {
+        let mut v = Voice::default();
+        v.note_on(NoteOnParams {
+            note,
+            velocity: 0.8,
+            base_freq: util::midi_note_to_freq(note),
+            start_phase_normalized: 0.0,
+            sample_rate: SR,
+            attack_ms: 10.0,
+            age,
+        });
+        v
+    }
+
+    /// Helper: make a releasing voice with a given age.
+    fn make_releasing_voice(age: u64, note: u8) -> Voice {
+        let mut v = make_active_voice(age, note);
+        // Advance through attack so release has a nonzero level.
+        let attack_samples = (10.0 * SR / 1000.0) as usize;
+        for _ in 0..attack_samples + 10 {
+            v.render_sample(0.0, SR);
+        }
+        v.note_off(100.0, SR);
+        v
+    }
+
+    #[test]
+    fn allocate_picks_idle_first() {
+        let voices = [
+            make_active_voice(1, 60),
+            Voice::default(), // idle
+            make_active_voice(2, 62),
+            Voice::default(), // idle
+        ];
+        // Should pick the first idle voice (index 1).
+        assert_eq!(allocate_voice(&voices, 4), 1);
+    }
+
+    #[test]
+    fn allocate_steals_oldest_releasing() {
+        let voices = [
+            make_active_voice(3, 60),
+            make_releasing_voice(1, 62), // releasing, age 1 (oldest)
+            make_releasing_voice(2, 64), // releasing, age 2
+            make_active_voice(4, 65),
+        ];
+        // No idle voices. Should steal oldest releasing (index 1, age 1).
+        assert_eq!(allocate_voice(&voices, 4), 1);
+    }
+
+    #[test]
+    fn allocate_steals_oldest_active() {
+        let voices = [
+            make_active_voice(3, 60),
+            make_active_voice(1, 62), // oldest active (age 1)
+            make_active_voice(2, 64),
+            make_active_voice(4, 65),
+        ];
+        // No idle or releasing voices. Should steal oldest active (index 1, age 1).
+        assert_eq!(allocate_voice(&voices, 4), 1);
+    }
+
+    #[test]
+    fn allocate_all_idle_returns_zero() {
+        let voices: [Voice; 4] = core::array::from_fn(|_| Voice::default());
+        assert_eq!(allocate_voice(&voices, 4), 0);
+    }
+
+    #[test]
+    fn allocate_respects_voice_count_limit() {
+        let voices = [
+            make_active_voice(1, 60),
+            make_active_voice(2, 62),
+            Voice::default(), // idle, but at index 2 (beyond voice_count=2)
+            Voice::default(),
+        ];
+        // voice_count=2, so only slots 0..2 are searched.
+        // Both are active, so steal oldest (index 0, age 1).
+        assert_eq!(allocate_voice(&voices, 2), 0);
     }
 }
