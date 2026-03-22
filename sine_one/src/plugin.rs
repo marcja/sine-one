@@ -25,6 +25,9 @@ pub struct SineOne {
     /// Cached base frequency (Hz) for the current note, before fine-tune.
     /// Stored to avoid recomputing `midi_note_to_freq` every sample.
     current_base_freq: f32,
+    /// Current pan position in [-1.0, 1.0]. Updated by PolyPan events.
+    /// -1.0 = hard left, 0.0 = center, 1.0 = hard right.
+    current_pan: f32,
 }
 
 impl Default for SineOne {
@@ -37,6 +40,7 @@ impl Default for SineOne {
             current_note: None,
             current_velocity: 0.0,
             current_base_freq: 0.0,
+            current_pan: 0.0,
         }
     }
 }
@@ -55,7 +59,7 @@ impl Plugin for SineOne {
         ..AudioIOLayout::const_default()
     }];
 
-    // Accept NoteOn / NoteOff only.
+    // Accept NoteOn, NoteOff, and polyphonic note expressions (PolyPan).
     const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
@@ -93,6 +97,7 @@ impl Plugin for SineOne {
         self.current_note = None;
         self.current_velocity = 0.0;
         self.current_base_freq = 0.0;
+        self.current_pan = 0.0;
     }
 
     fn process(
@@ -135,6 +140,18 @@ impl Plugin for SineOne {
                             self.current_note = None;
                         }
                     }
+                    // NOTE(poly_pan): We accept all PolyPan events regardless of the
+                    //   note field. This is a monophonic synth with one voice, and
+                    //   PolyPan may arrive before NoteOn in the same buffer (e.g., from
+                    //   Bitwig's Randomize device). Strict note matching would drop
+                    //   those events.
+                    // REVIEW(pan_smoothing): Pan changes apply instantly at the sample
+                    //   they arrive. If continuous pan automation causes audible zipper
+                    //   noise, add a one-pole smoother here. Unlikely for per-note pan
+                    //   from Bitwig's Randomize device.
+                    NoteEvent::PolyPan { pan, .. } => {
+                        self.current_pan = pan;
+                    }
                     _ => (),
                 }
 
@@ -156,11 +173,19 @@ impl Plugin for SineOne {
             // Generate audio: oscillator × envelope × velocity.
             let osc_sample = self.oscillator.next_sample();
             let env_sample = self.envelope.next_sample();
-            let output = osc_sample * env_sample * self.current_velocity;
+            let mono_output = osc_sample * env_sample * self.current_velocity;
 
-            // Write identical mono signal to both stereo channels.
-            for sample in channel_samples.iter_mut() {
-                *sample = output;
+            // Apply constant-power stereo panning.
+            let (left_sample, right_sample) =
+                crate::dsp::pan::apply_constant_power_pan(mono_output, self.current_pan);
+
+            // Write to stereo output. AUDIO_IO_LAYOUTS guarantees exactly 2 channels.
+            let mut channels = channel_samples.iter_mut();
+            if let Some(left) = channels.next() {
+                *left = left_sample;
+            }
+            if let Some(right) = channels.next() {
+                *right = right_sample;
             }
         }
 
@@ -449,9 +474,10 @@ mod tests {
     }
 
     #[test]
-    fn both_channels_equal() {
+    fn center_pan_both_channels_equal() {
         let mut plugin = init_plugin(44100.0);
 
+        // With default center pan (0.0), both channels should be equal.
         let events = vec![NoteEvent::NoteOn {
             timing: 0,
             voice_id: None,
@@ -461,7 +487,169 @@ mod tests {
         }];
         let (left, right) = run_process(&mut plugin, 256, events);
 
-        // Stereo output should be identical (mono signal duplicated).
-        assert_eq!(left, right, "left and right channels should be identical");
+        assert_eq!(
+            left, right,
+            "left and right channels should be equal at center pan"
+        );
+    }
+
+    #[test]
+    fn poly_pan_hard_left_silences_right() {
+        let mut plugin = init_plugin(44100.0);
+
+        let events = vec![
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            },
+            NoteEvent::PolyPan {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                pan: -1.0,
+            },
+        ];
+        let (left, right) = run_process(&mut plugin, 256, events);
+
+        // Left channel should have nonzero output.
+        assert!(
+            left.iter().any(|&s| s != 0.0),
+            "left channel should have nonzero output at hard-left pan"
+        );
+        // Right channel should be silent.
+        assert!(
+            right.iter().all(|&s| s.abs() < 1e-6),
+            "right channel should be silent at hard-left pan"
+        );
+    }
+
+    #[test]
+    fn poly_pan_hard_right_silences_left() {
+        let mut plugin = init_plugin(44100.0);
+
+        let events = vec![
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            },
+            NoteEvent::PolyPan {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                pan: 1.0,
+            },
+        ];
+        let (left, right) = run_process(&mut plugin, 256, events);
+
+        // Right channel should have nonzero output.
+        assert!(
+            right.iter().any(|&s| s != 0.0),
+            "right channel should have nonzero output at hard-right pan"
+        );
+        // Left channel should be silent.
+        assert!(
+            left.iter().all(|&s| s.abs() < 1e-6),
+            "left channel should be silent at hard-right pan"
+        );
+    }
+
+    #[test]
+    fn poly_pan_mid_buffer_timing() {
+        let mut plugin = init_plugin(44100.0);
+        let mid = 128u32;
+
+        let events = vec![
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            },
+            NoteEvent::PolyPan {
+                timing: mid,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                pan: 1.0,
+            },
+        ];
+        let (left, right) = run_process(&mut plugin, 256, events);
+
+        // Before the PolyPan (samples 0..128), center pan → L == R.
+        // Skip sample 0 because the envelope starts from zero.
+        for i in 1..mid as usize {
+            assert!(
+                (left[i] - right[i]).abs() < 1e-6,
+                "before PolyPan at sample {i}: left {} != right {}",
+                left[i],
+                right[i]
+            );
+        }
+
+        // After the PolyPan (samples 128..256), hard-right → left should be ~0.
+        for i in mid as usize..256 {
+            assert!(
+                left[i].abs() < 1e-6,
+                "after hard-right pan at sample {i}: left {} should be ~0",
+                left[i]
+            );
+        }
+    }
+
+    #[test]
+    fn reset_clears_pan() {
+        let mut plugin = init_plugin(44100.0);
+
+        // Set a non-default pan value, then reset.
+        plugin.current_pan = 0.5;
+        plugin.reset();
+
+        assert_eq!(
+            plugin.current_pan, 0.0,
+            "current_pan should be 0.0 after reset"
+        );
+    }
+
+    #[test]
+    fn poly_pan_persists_across_notes() {
+        let mut plugin = init_plugin(44100.0);
+
+        // Set pan first, then start a note — pan should persist.
+        let events = vec![
+            NoteEvent::PolyPan {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                pan: 1.0,
+            },
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 69,
+                velocity: 1.0,
+            },
+        ];
+        let (left, right) = run_process(&mut plugin, 256, events);
+
+        // Hard-right pan should persist: left silent, right nonzero.
+        assert!(
+            right.iter().any(|&s| s != 0.0),
+            "right channel should have output when pan persists"
+        );
+        assert!(
+            left.iter().all(|&s| s.abs() < 1e-6),
+            "left channel should be silent when pan is hard-right"
+        );
     }
 }

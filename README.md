@@ -12,6 +12,7 @@ workflow with every design decision documented — not a feature-rich instrument
 - Accepts MIDI NoteOn / NoteOff
 - Plays a sine oscillator tuned to the incoming note and velocity
 - Shapes the output with a linear AR (Attack/Release) envelope
+- Responds to **PolyPan** note expression events for stereo panning (e.g., from Bitwig's Randomize device)
 - Exposes three parameters: **Fine Tune** (±100 cents), **Attack** (1–5000 ms), **Release** (1–10000 ms)
 - No filter, no polyphony, no GUI
 
@@ -57,7 +58,8 @@ sine-one/
         └── dsp/
             ├── mod.rs
             ├── oscillator.rs   # SineOscillator — phase accumulator + frequency math
-            └── envelope.rs     # ArEnvelope — Idle/Attack/Release state machine
+            ├── envelope.rs     # ArEnvelope — Idle/Attack/Release state machine
+            └── pan.rs          # Constant-power stereo panning (sin/cos pan law)
 ```
 
 The split is intentional: `params.rs` is what the user controls, `dsp/` is the audio math,
@@ -158,6 +160,7 @@ After installing and rescanning, verify the following manually:
 6. Fine Tune automated from −100 to +100 cents: pitch sweeps smoothly, no zipper noise
 7. Save project, close, reopen: all three parameters restore correctly
 8. Rapid repeated MIDI notes produce no audible clicks
+9. Randomize device → Pan: signal moves in the stereo field between notes
 
 ---
 

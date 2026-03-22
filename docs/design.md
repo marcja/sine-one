@@ -21,24 +21,25 @@ codebase is intentionally small so every line is traceable back to a design deci
 |---|---|
 | Type | Instrument |
 | Audio input | None |
-| Audio output | Stereo (both channels carry the same mono signal) |
-| MIDI input | `MidiConfig::Basic` — NoteOn + NoteOff only |
+| Audio output | Stereo (mono signal with constant-power panning via PolyPan expression events) |
+| MIDI input | `MidiConfig::Basic` — NoteOn, NoteOff, and polyphonic expressions (PolyPan) |
 | MIDI output | None |
 | CLAP features | `CLAP_FEATURE_INSTRUMENT`, `CLAP_FEATURE_SYNTHESIZER`, `CLAP_FEATURE_MONO` |
 | GUI | None — generic host parameter list |
 
-**Why stereo out with a mono signal?** Most DAWs expect instruments to produce stereo output.
-Producing identical L/R is the simplest way to satisfy that without adding any panning or
-width DSP to the plugin itself.
+**Why stereo out?** Most DAWs expect instruments to produce stereo output. The plugin applies
+constant-power panning (via `PolyPan` note expression events) to position the mono signal in the
+stereo field. With no PolyPan event, output defaults to center (equal L/R).
 
 ---
 
 ## DSP Architecture
 
 ```
-MIDI NoteOn ──► SineOscillator ──► ArEnvelope ──► gain (velocity) ──► [L] out
-                    │                                                    [R] out (same)
+MIDI NoteOn ──► SineOscillator ──► ArEnvelope ──► gain (velocity) ──► Pan ──► [L] out
+                    │                                                          [R] out
 MIDI NoteOff ───────┘ (triggers Release phase)
+MIDI PolyPan ──────────────────────────────────────────────────────────► Pan
 ```
 
 ### SineOscillator
@@ -107,6 +108,38 @@ output = osc_sample * envelope_level * velocity
 This velocity value is stored on the plugin struct at note-on and applied per-sample in the
 process loop.
 
+### Stereo Panning
+
+The plugin responds to `PolyPan` note expression events (available at `MidiConfig::Basic` in
+nih-plug). Pan is a per-note value in [-1.0, 1.0]: -1.0 = hard left, 0.0 = center, 1.0 = hard
+right. The default is center (equal L/R).
+
+**Constant-power pan law** preserves perceived loudness across the stereo field:
+
+```
+theta = (pan + 1) * PI/4       — maps [-1, 1] to [0, PI/2]
+left  = mono_output * cos(theta)
+right = mono_output * sin(theta)
+```
+
+At center: `cos(PI/4) = sin(PI/4) = 1/sqrt(2)`, so `left² + right² = mono²` (constant power).
+At hard left: `cos(0) = 1`, `sin(0) = 0` — full signal in L, silence in R. Vice versa at hard
+right.
+
+**Why constant-power instead of linear?** Linear panning (`left = (1-pan)/2`) causes a ~3 dB
+perceived volume dip at center. Constant-power avoids this and is the industry-standard approach.
+
+**Pan is not smoothed.** Changes apply instantly at the sample they arrive. For per-note pan
+from devices like Bitwig's Randomize, zipper noise is unlikely. If continuous pan automation is
+added later, a one-pole smoother could be inserted here.
+
+**Pan persists across notes.** A PolyPan event sets the pan position until the next PolyPan or
+`reset()`. It is not reset on NoteOn. This matches the behavior of Bitwig's Randomize device,
+which may send PolyPan before or after NoteOn in the same buffer.
+
+**All PolyPan events are accepted** regardless of the `note` field. This is a monophonic synth
+with one voice — strict note matching would drop events that arrive before NoteOn.
+
 ---
 
 ## Parameter System
@@ -166,9 +199,10 @@ sine-one/
         ├── plugin.rs       # SineOne struct + Plugin trait impl (process, initialize, reset)
         ├── params.rs       # SineOneParams struct with three FloatParams
         ├── dsp/
-        │   ├── mod.rs      # pub mod oscillator; pub mod envelope;
+        │   ├── mod.rs      # pub mod oscillator; pub mod envelope; pub mod pan;
         │   ├── oscillator.rs   # SineOscillator: phase, set_frequency(), next_sample(), reset()
-        │   └── envelope.rs     # ArEnvelope: EnvState enum, ArEnvelope struct, all methods
+        │   ├── envelope.rs     # ArEnvelope: EnvState enum, ArEnvelope struct, all methods
+        │   └── pan.rs          # apply_constant_power_pan(): stereo panning via sin/cos pan law
         └── main.rs         # standalone binary: nih_export_standalone::<SineOne>()
 ```
 
@@ -241,6 +275,13 @@ Tests live in `#[cfg(test)]` blocks in the same file as the struct under test.
 - `retrigger_preserves_level` — calling `note_on()` mid-attack preserves the current level
 - `retrigger_during_release_preserves_level` — calling `note_on()` mid-release preserves the current level
 
+**`pan.rs`:**
+- `center_pan_equal_channels` — pan=0 produces L == R ≈ sample × 1/√2
+- `hard_left_silences_right` — pan=-1 → right=0, left=sample
+- `hard_right_silences_left` — pan=1 → left=0, right=sample
+- `constant_power_at_center` — L² + R² ≈ sample²
+- `pan_is_monotonic` — as pan goes -1→1, left decreases, right increases
+
 **`params.rs`:**
 - `param_defaults_in_range` — verify each param's default value is within its declared min/max
   (simple smoke test; catches a common copy-paste error)
@@ -256,6 +297,15 @@ proptest! {
         for _ in 0..512 {
             prop_assert!(osc.next_sample().is_finite());
         }
+    }
+}
+```
+
+**`pan.rs`:**
+```rust
+proptest! {
+    fn constant_power_across_range(pan in -1.0f32..=1.0, sample in -1.0f32..=1.0) {
+        // left² + right² should equal sample² (constant power) and both must be finite
     }
 }
 ```
@@ -303,7 +353,12 @@ Tests:
   at least some output should be nonzero
 - `note_off_eventually_silences` — after NoteOff with default release (300ms), output should reach
   zero within the expected number of samples
-- `both_channels_equal` — verify L and R channels carry identical output (mono duplication)
+- `center_pan_both_channels_equal` — verify L and R channels are equal at default center pan
+- `poly_pan_hard_left_silences_right` — hard-left pan produces nonzero L, silent R
+- `poly_pan_hard_right_silences_left` — hard-right pan produces nonzero R, silent L
+- `poly_pan_mid_buffer_timing` — PolyPan at sample 128: center before, panned after
+- `reset_clears_pan` — `reset()` returns pan to center (0.0)
+- `poly_pan_persists_across_notes` — pan set before NoteOn persists (not reset on NoteOn)
 
 **Pedagogical note:** These tests don't require a real DAW or audio driver. You instantiate the
 plugin struct directly and call its methods with mock contexts. This is the layer that confirms
@@ -441,6 +496,8 @@ cargo run -p sine_one --features standalone -- --output "Built-in Output"
 5. **Fine tune works** — automate Fine Tune from -100 to +100 cents; pitch should sweep smoothly
 6. **State save/load** — save project, close, reopen; parameters restore correctly
 7. **Smooth retrigger** — rapid MIDI notes should not produce audible clicks or dips to silence
+8. **Pan expression** — add a Randomize device before SineOne; randomize Pan; hear the signal
+   move in the stereo field between notes
 
 ---
 
@@ -476,6 +533,6 @@ Make it executable: `chmod +x .git/hooks/pre-commit`
    the phase is wherever it left off, which avoids phase discontinuity. This is the correct
    behavior; document here in case it looks like a bug.
 
-4. **Mono vs. stereo output layout**: Both channels carry the same signal (duplication). If you
-   later want to add pan or stereo effects (e.g., slight detuning between L/R), the I/O layout
-   already supports it.
+4. **~~Mono vs. stereo output layout~~** *(resolved)*: The plugin now applies constant-power
+   panning via `PolyPan` note expression events. At center pan (default), both channels carry
+   equal signal. The `dsp/pan.rs` module implements the sin/cos pan law.
