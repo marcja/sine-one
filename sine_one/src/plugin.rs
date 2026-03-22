@@ -49,6 +49,17 @@ impl Default for SineOne {
     }
 }
 
+impl SineOne {
+    /// Sync the gain smoother to the current voice-count parameter.
+    /// Called from both `initialize()` and `reset()` so that `process()`
+    /// always starts with the correct gain level.
+    fn sync_voice_gain(&mut self) {
+        let voice_count = self.params.voices.value() as usize;
+        self.gain_smoother.set_immediate(1.0 / voice_count as f32);
+        self.previous_voice_count = voice_count;
+    }
+}
+
 impl Plugin for SineOne {
     const NAME: &'static str = "SineOne";
     const VENDOR: &'static str = "sine-one";
@@ -84,10 +95,7 @@ impl Plugin for SineOne {
         // and envelope times from parameter values.
         self.sample_rate = buffer_config.sample_rate;
 
-        // Initialize gain compensation for the current voice count.
-        let voice_count = self.params.voices.value() as usize;
-        self.gain_smoother.set_immediate(1.0 / voice_count as f32);
-        self.previous_voice_count = voice_count;
+        self.sync_voice_gain();
 
         true
     }
@@ -99,7 +107,7 @@ impl Plugin for SineOne {
         }
         self.next_voice_age = 0;
         self.gain_smoother.reset();
-        self.previous_voice_count = 1;
+        self.sync_voice_gain();
     }
 
     fn process(
@@ -311,7 +319,8 @@ mod tests {
         fn set_current_voice_capacity(&self, _capacity: u32) {}
     }
 
-    /// Helper: call initialize() on a plugin instance with the given sample rate.
+    /// Helper: call initialize() then reset() on a plugin instance, matching
+    /// the real nih-plug host lifecycle (Default → initialize → reset → process).
     fn initialize_plugin(mut plugin: SineOne, sample_rate: f32) -> SineOne {
         let layout = SineOne::AUDIO_IO_LAYOUTS[0];
         let config = BufferConfig {
@@ -322,6 +331,7 @@ mod tests {
         };
         let result = plugin.initialize(&layout, &config, &mut MockInitContext);
         assert!(result, "initialize() should return true");
+        plugin.reset();
         plugin
     }
 
