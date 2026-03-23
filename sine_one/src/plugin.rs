@@ -223,7 +223,8 @@ impl Plugin for SineOne {
             let mut right_sum = 0.0_f32;
             for voice in &mut self.voices {
                 if !voice.is_idle() {
-                    let (l, r) = voice.render_sample(fine_tune_cents, self.sample_rate);
+                    // TODO: fold hardcoded to 0.0 — will be wired to param in next commit
+                    let (l, r) = voice.render_sample(fine_tune_cents, 0.0, self.sample_rate);
                     left_sum += l;
                     right_sum += r;
                 }

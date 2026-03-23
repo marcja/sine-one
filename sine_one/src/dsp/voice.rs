@@ -2,6 +2,7 @@ use super::envelope::ArEnvelope;
 use super::oscillator::{apply_detune, SineOscillator};
 use super::pan::apply_constant_power_pan;
 use super::smoother::LinearSmoother;
+use super::wavefold::wavefold;
 
 fn center_pan_gains() -> (f32, f32) {
     apply_constant_power_pan(1.0, 0.0)
@@ -200,11 +201,16 @@ impl Voice {
     /// Generate one stereo sample from this voice.
     ///
     /// Applies fine-tune detune to the base frequency, runs the oscillator
-    /// and envelope, multiplies by velocity, then applies constant-power
-    /// stereo panning.
+    /// through the wavefolder, multiplies by envelope and velocity, then
+    /// applies constant-power stereo panning.
     ///
     /// Returns `(left, right)`. Returns `(0.0, 0.0)` when idle.
-    pub fn render_sample(&mut self, fine_tune_cents: f32, sample_rate: f32) -> (f32, f32) {
+    pub fn render_sample(
+        &mut self,
+        fine_tune_cents: f32,
+        fold: f32,
+        sample_rate: f32,
+    ) -> (f32, f32) {
         if self.env.is_idle() {
             return (0.0, 0.0);
         }
@@ -213,11 +219,12 @@ impl Voice {
         let freq = apply_detune(self.base_freq, fine_tune_cents);
         self.osc.set_frequency(freq, sample_rate);
 
-        // Generate audio: oscillator × envelope × smoothed velocity.
+        // Generate audio: oscillator → wavefold → envelope × velocity.
         let osc_sample = self.osc.next_sample();
+        let folded = wavefold(osc_sample, fold);
         let env_sample = self.env.next_sample();
         let velocity = self.velocity_smoother.next_sample();
-        let mono_output = osc_sample * env_sample * velocity;
+        let mono_output = folded * env_sample * velocity;
 
         let pan_left = self.pan_left_smoother.next_sample();
         let pan_right = self.pan_right_smoother.next_sample();
@@ -317,7 +324,7 @@ mod tests {
         // Render several samples and check for nonzero output.
         let mut found_nonzero = false;
         for _ in 0..100 {
-            let (l, r) = voice.render_sample(0.0, SR);
+            let (l, r) = voice.render_sample(0.0, 0.0, SR);
             if l != 0.0 || r != 0.0 {
                 found_nonzero = true;
                 break;
@@ -337,7 +344,7 @@ mod tests {
         // Advance through attack.
         let attack_samples = (10.0 * SR / 1000.0) as usize;
         for _ in 0..attack_samples + 10 {
-            voice.render_sample(0.0, SR);
+            voice.render_sample(0.0, 0.0, SR);
         }
 
         voice.note_off(100.0, SR);
@@ -350,7 +357,7 @@ mod tests {
         // Complete release.
         let release_samples = (100.0 * SR / 1000.0) as usize;
         for _ in 0..release_samples + 10 {
-            voice.render_sample(0.0, SR);
+            voice.render_sample(0.0, 0.0, SR);
         }
         assert!(
             voice.is_idle(),
@@ -363,7 +370,7 @@ mod tests {
         let mut voice = Voice::default();
         trigger_voice(&mut voice, A4_NOTE, 0.8, 0.0);
         for _ in 0..100 {
-            voice.render_sample(0.0, SR);
+            voice.render_sample(0.0, 0.0, SR);
         }
 
         voice.reset();
@@ -373,7 +380,7 @@ mod tests {
         assert_eq!(voice.age(), 0, "age should be 0 after reset");
 
         // Should produce silence.
-        let (l, r) = voice.render_sample(0.0, SR);
+        let (l, r) = voice.render_sample(0.0, 0.0, SR);
         assert_eq!((l, r), (0.0, 0.0), "reset voice should output silence");
     }
 
@@ -387,14 +394,14 @@ mod tests {
         // Render through the pan ramp so gains have settled.
         let ramp_warmup = (PAN_RAMP_SECS * SR) as usize + 10;
         for _ in 0..ramp_warmup {
-            voice.render_sample(0.0, SR);
+            voice.render_sample(0.0, 0.0, SR);
         }
 
         // Now measure stereo balance after ramp has completed.
         let mut left_sum = 0.0_f32;
         let mut right_sum = 0.0_f32;
         for _ in 0..50 {
-            let (l, r) = voice.render_sample(0.0, SR);
+            let (l, r) = voice.render_sample(0.0, 0.0, SR);
             left_sum += l.abs();
             right_sum += r.abs();
         }
@@ -417,7 +424,7 @@ mod tests {
 
         // Advance to build up some state.
         for _ in 0..200 {
-            voice.render_sample(0.0, SR);
+            voice.render_sample(0.0, 0.0, SR);
         }
 
         // Retrigger at 0° start phase — should NOT reset phase.
@@ -453,7 +460,7 @@ mod tests {
 
         // Advance to build up some state.
         for _ in 0..200 {
-            voice.render_sample(0.0, SR);
+            voice.render_sample(0.0, 0.0, SR);
         }
         assert!(!voice.is_idle());
 
@@ -500,7 +507,7 @@ mod tests {
         // Advance through attack so release has a nonzero level.
         let attack_samples = (10.0 * SR / 1000.0) as usize;
         for _ in 0..attack_samples + 10 {
-            v.render_sample(0.0, SR);
+            v.render_sample(0.0, 0.0, SR);
         }
         v.note_off(100.0, SR);
         v
@@ -591,7 +598,7 @@ mod tests {
 
         // First render_sample should produce non-negligible output because
         // the envelope starts at initial_level = |sin(90°)| * 1.0 = 1.0.
-        let (l, r) = voice.render_sample(0.0, SR);
+        let (l, r) = voice.render_sample(0.0, 0.0, SR);
         let mono = l.abs().max(r.abs());
         assert!(
             mono > 0.5,
@@ -606,7 +613,7 @@ mod tests {
         trigger_voice_with_attack(&mut voice, A4_NOTE, 1.0, 0.25, 500.0);
 
         // First sample should be near zero — long attack suppresses the transient.
-        let (l, r) = voice.render_sample(0.0, SR);
+        let (l, r) = voice.render_sample(0.0, 0.0, SR);
         let mono = l.abs().max(r.abs());
         assert!(
             mono < 0.01,
@@ -621,7 +628,7 @@ mod tests {
         trigger_voice_with_attack(&mut voice, A4_NOTE, 1.0, 0.0, 1.0);
 
         // First sample should be near zero — sin(0°) = 0, no transient regardless.
-        let (l, r) = voice.render_sample(0.0, SR);
+        let (l, r) = voice.render_sample(0.0, 0.0, SR);
         let mono = l.abs().max(r.abs());
         assert!(
             mono < 0.01,
@@ -640,14 +647,14 @@ mod tests {
         voice.set_pan(-1.0, SR);
         let ramp_samples = (PAN_RAMP_SECS * SR) as usize + 10;
         for _ in 0..ramp_samples {
-            voice.render_sample(0.0, SR);
+            voice.render_sample(0.0, 0.0, SR);
         }
 
         // Now switch to hard-right. On the very first sample after the change,
         // the left channel should NOT be zero — it should still be near the old
         // hard-left gain, proving the pan is smoothed rather than instant.
         voice.set_pan(1.0, SR);
-        let (left, _right) = voice.render_sample(0.0, SR);
+        let (left, _right) = voice.render_sample(0.0, 0.0, SR);
         assert!(
             left.abs() > 0.01,
             "first sample after pan change should not be zero (smoothing), got left={left}"
@@ -663,14 +670,14 @@ mod tests {
         voice.set_pan(1.0, SR);
         let ramp_samples = (PAN_RAMP_SECS * SR) as usize + 20;
         for _ in 0..ramp_samples {
-            voice.render_sample(0.0, SR);
+            voice.render_sample(0.0, 0.0, SR);
         }
 
         // After the ramp completes, left should be ~0 (hard-right pan).
         let mut left_sum = 0.0_f32;
         let mut right_sum = 0.0_f32;
         for _ in 0..50 {
-            let (l, r) = voice.render_sample(0.0, SR);
+            let (l, r) = voice.render_sample(0.0, 0.0, SR);
             left_sum += l.abs();
             right_sum += r.abs();
         }
@@ -681,6 +688,40 @@ mod tests {
         assert!(
             right_sum > 0.1,
             "after ramp to hard-right, right should have energy, got {right_sum}"
+        );
+    }
+
+    // --- wavefold tests ---
+
+    #[test]
+    fn voice_render_fold_nonzero_changes_timbre() {
+        // Two identical voices, one with fold=0, one with fold=0.5.
+        // Their outputs should differ, proving fold is applied.
+        let mut voice_dry = Voice::default();
+        let mut voice_wet = Voice::default();
+        trigger_voice(&mut voice_dry, A4_NOTE, 1.0, 0.0);
+        trigger_voice(&mut voice_wet, A4_NOTE, 1.0, 0.0);
+
+        // Advance both through attack.
+        let attack_samples = (10.0 * SR / 1000.0) as usize + 10;
+        for _ in 0..attack_samples {
+            voice_dry.render_sample(0.0, 0.0, SR);
+            voice_wet.render_sample(0.0, 0.5, SR);
+        }
+
+        // Compare several samples in the hold phase.
+        let mut any_differ = false;
+        for _ in 0..100 {
+            let (dl, _) = voice_dry.render_sample(0.0, 0.0, SR);
+            let (wl, _) = voice_wet.render_sample(0.0, 0.5, SR);
+            if (dl - wl).abs() > 1e-6 {
+                any_differ = true;
+                break;
+            }
+        }
+        assert!(
+            any_differ,
+            "fold=0.5 should produce different output than fold=0"
         );
     }
 }

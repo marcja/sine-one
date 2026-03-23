@@ -24,7 +24,7 @@ fn make_voice(note: u8, pan: f32, age: u64) -> Voice {
     voice.set_pan(pan, SAMPLE_RATE);
     // Warm up past pan ramp (~88 samples) and attack phase (441 samples).
     for _ in 0..BUFFER_SIZE {
-        voice.render_sample(0.0, SAMPLE_RATE);
+        voice.render_sample(0.0, 0.0, SAMPLE_RATE);
     }
     voice
 }
@@ -46,7 +46,7 @@ fn render_buffer(voices: &mut [Voice], gain_smoother: &mut LinearSmoother) {
         let mut left_sum = 0.0_f32;
         let mut right_sum = 0.0_f32;
         for voice in voices.iter_mut() {
-            let (l, r) = voice.render_sample(FINE_TUNE_CENTS, SAMPLE_RATE);
+            let (l, r) = voice.render_sample(FINE_TUNE_CENTS, 0.0, SAMPLE_RATE);
             left_sum += l;
             right_sum += r;
         }
@@ -139,7 +139,7 @@ fn voice_benchmarks(c: &mut Criterion) {
         let mut voice = make_voice(60, 0.0, 1);
         b.iter(|| {
             for _ in 0..BUFFER_SIZE {
-                black_box(voice.render_sample(FINE_TUNE_CENTS, SAMPLE_RATE));
+                black_box(voice.render_sample(FINE_TUNE_CENTS, 0.0, SAMPLE_RATE));
             }
         });
     });
