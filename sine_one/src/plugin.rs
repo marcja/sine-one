@@ -212,10 +212,10 @@ impl Plugin for SineOne {
                 next_event = context.next_event();
             }
 
-            // Read smoothed fine-tune value per-sample to support real-time
-            // pitch modulation (vibrato, automation). The smoother must be
-            // consumed every sample even when no note is active.
+            // Read smoothed per-sample values to support real-time automation.
+            // The smoothers must be consumed every sample even when no note is active.
             let fine_tune_cents = self.params.fine_tune.smoothed.next();
+            let fold = self.params.fold.smoothed.next();
             let gain = self.gain_smoother.next_sample();
 
             // Sum all active voices.
@@ -223,8 +223,7 @@ impl Plugin for SineOne {
             let mut right_sum = 0.0_f32;
             for voice in &mut self.voices {
                 if !voice.is_idle() {
-                    // TODO: fold hardcoded to 0.0 — will be wired to param in next commit
-                    let (l, r) = voice.render_sample(fine_tune_cents, 0.0, self.sample_rate);
+                    let (l, r) = voice.render_sample(fine_tune_cents, fold, self.sample_rate);
                     left_sum += l;
                     right_sum += r;
                 }
