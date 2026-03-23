@@ -9,10 +9,10 @@
 ## Overview
 
 SineOne is a minimal polyphonic sine-wave synthesizer CLAP plugin. It accepts MIDI NoteOn/NoteOff
-events, plays up to 8 simultaneous sine oscillators tuned to incoming note pitches, and shapes each
-voice's output with a two-stage AR (Attack/Release) envelope. There is no filter, no GUI, and no
-effects. The entire codebase is intentionally small so every line is traceable back to a design
-decision documented here.
+events, plays up to 8 simultaneous sine oscillators tuned to incoming note pitches, shapes each
+voice's timbre with a sine wavefolder, and controls amplitude with a two-stage AR (Attack/Release)
+envelope. There is no filter, no GUI, and no effects beyond the built-in wavefolder. The entire
+codebase is intentionally small so every line is traceable back to a design decision documented here.
 
 ---
 
@@ -37,13 +37,13 @@ stereo field. With no PolyPan event, output defaults to center (equal L/R).
 ## DSP Architecture
 
 ```
-                 ┌─────────────── Voice 0 ───────────────────────┐
-MIDI NoteOn ──►  │ SineOscillator → ArEnvelope → Vel → Pan Gains │──┐
-allocate_voice() └───────────────────────────────────────────────┘  │
-                 ┌─────────────── Voice 1 ───────────────────────┐  ├─► Sum → Gain(1/√N) → Output Gain → [L,R]
-                 │ SineOscillator → ArEnvelope → Vel → Pan Gains │──┤
-                 └───────────────────────────────────────────────┘  │
-                 ...up to Voice 7                                   ┘
+                 ┌──────────────────── Voice 0 ──────────────────────────┐
+MIDI NoteOn ──►  │ SineOscillator → Wavefold → ArEnvelope → Vel → Pan   │──┐
+allocate_voice() └──────────────────────────────────────────────────────┘  │
+                 ┌──────────────────── Voice 1 ──────────────────────────┐  ├─► Sum → Gain(1/√N) → Output Gain → [L,R]
+                 │ SineOscillator → Wavefold → ArEnvelope → Vel → Pan   │──┤
+                 └──────────────────────────────────────────────────────┘  │
+                 ...up to Voice 7                                          ┘
 MIDI NoteOff ──► oldest voice with matching note → Release phase
 MIDI PolyPan ──► voice with matching note → update pan gains
 ```
@@ -68,6 +68,34 @@ base_freq  = midi_note_to_freq(note)       // nih_plug::util::midi_note_to_freq
 detune_mult = 2^(fine_tune_cents / 1200)   // 1200 cents per octave
 frequency  = base_freq * detune_mult
 ```
+
+### Wavefolder
+
+A sine wavefolder that adds harmonic content to the pure sine oscillator output. The `fold`
+parameter (0–1) controls the amount of folding:
+
+```
+fold = 0:   bypass — output = input (identity, pure sine preserved)
+fold > 0:   drive = 1.0 + fold * (MAX_DRIVE - 1.0)
+            output = sin(input * drive)
+            MAX_DRIVE = 4π ≈ 12.57
+```
+
+**Why a sine wavefolder?** Applying `sin()` to a sine input creates harmonics at exact integer
+multiples of the fundamental (Bessel-weighted odd harmonics). This is the classic Buchla 259
+wavefolder concept. The output is naturally bounded to [-1, 1] — no clamping or normalization
+needed.
+
+**Why bypass at zero instead of `sin(input * 1.0)`?** `sin(sin(θ))` is NOT identity — it
+introduces subtle odd harmonics even at drive=1.0. True transparency at the default requires an
+explicit bypass check.
+
+**Signal chain position:** The wavefolder sits between the oscillator and envelope. This means the
+envelope shapes the amplitude of the already-folded waveform, which is the standard modular synth
+signal flow.
+
+**Smoothing:** The `fold` parameter is smoothed at 20ms (matching `fine_tune`) to prevent zipper
+noise when automated. The smoothed value is read per-sample in `process()`.
 
 ### ArEnvelope
 
@@ -124,7 +152,7 @@ In nih-plug, `NoteEvent::NoteOn { velocity, .. }` provides velocity as an `f32` 
 normalized to [0.0, 1.0] (not a raw `u8` 0–127). The output is scaled directly:
 
 ```
-output = osc_sample * envelope_level * velocity
+output = wavefold(osc_sample, fold) * envelope_level * velocity
 ```
 
 Velocity is applied per-sample via a `LinearSmoother`. When starting from silence (envelope
@@ -179,10 +207,10 @@ gain compensation.
 ### Voice Architecture
 
 ```
-                 ┌─ Voice 0: Osc → Env → Vel → Pan ─┐
-MIDI NoteOn ──►  ├─ Voice 1: Osc → Env → Vel → Pan ─┤──► Sum ──► Gain(1/√N) ──► Output Gain ──► [L,R]
-                 ├─ Voice 2: ...                     ┤
-allocate_voice() └─ Voice N-1: ...                   ┘
+                 ┌─ Voice 0: Osc → Fold → Env → Vel → Pan ─┐
+MIDI NoteOn ──►  ├─ Voice 1: Osc → Fold → Env → Vel → Pan ─┤──► Sum ──► Gain(1/√N) ──► Output Gain ──► [L,R]
+                 ├─ Voice 2: ...                             ┤
+allocate_voice() └─ Voice N-1: ...                           ┘
 ```
 
 Each `Voice` struct (in `dsp/voice.rs`) bundles `SineOscillator`, `ArEnvelope`, `LinearSmoother`
@@ -251,11 +279,13 @@ When `Voices` increases: no immediate effect. New slots become available for the
 | Attack | `"attack"` | `FloatParam` | 1 to 5000 | 10.0 | `None` | ms | Skewed (log-ish feel) |
 | Release | `"release"` | `FloatParam` | 1 to 10000 | 300.0 | `None` | ms | Skewed (log-ish feel) |
 | Start Phase | `"start_phase"` | `FloatParam` | 0 to 360 | 0.0 | `None` | ° | Oscillator phase on NoteOn |
+| Fold | `"fold"` | `FloatParam` | 0 to 1 | 0.0 | `Linear(20ms)` | % | Wavefolder amount; 0 = bypass |
 | Voices | `"voices"` | `IntParam` | 1 to 8 | 1 | `None` | — | Polyphonic voice count |
 | Output Gain | `"output_gain"` | `FloatParam` | −24 to +12 | 0.0 | `None` | dB | Attenuverter; read per-block |
 
 **Notes on smoothing choices:**
-- `Fine Tune` uses `Linear(20ms)` so pitch slides smoothly when automated (avoids zipper noise).
+- `Fine Tune` and `Fold` use `Linear(20ms)` so pitch and timbre slide smoothly when automated
+  (avoids zipper noise). Both are read per-sample in `process()`.
 - `Attack` and `Release` use `None` because they control the *shape* of the next envelope, not a
   sample-by-sample audio signal. Their value is read at note-on/note-off boundaries, not
   per-sample. Smoothing here would be meaningless.
@@ -274,7 +304,7 @@ the display name on purpose.
 
 ## State & Preset Design
 
-All plugin state is captured by the six `Params` fields — no custom serialization needed. When
+All plugin state is captured by the seven `Params` fields — no custom serialization needed. When
 the DAW saves a project or preset, nih-plug serializes the `Params` struct automatically via the
 `#[derive(Params)]` macro.
 
@@ -300,13 +330,14 @@ sine-one/
     └── src/
         ├── lib.rs          # nih_export_clap!(plugin::SineOne); re-exports
         ├── plugin.rs       # SineOne struct + Plugin trait impl (process, initialize, reset)
-        ├── params.rs       # SineOneParams struct with five FloatParams + one IntParam
+        ├── params.rs       # SineOneParams struct with six FloatParams + one IntParam
         ├── dsp/
-        │   ├── mod.rs      # pub mod oscillator; envelope; pan; smoother; voice;
+        │   ├── mod.rs      # pub mod oscillator; envelope; pan; smoother; voice; wavefold;
         │   ├── oscillator.rs   # SineOscillator: phase, set_frequency(), next_sample(), reset()
         │   ├── envelope.rs     # ArEnvelope: EnvState enum, ArEnvelope struct, all methods
         │   ├── smoother.rs     # LinearSmoother: linear ramp for click-free parameter transitions
         │   ├── pan.rs          # apply_constant_power_pan(): stereo panning via sin/cos pan law
+        │   ├── wavefold.rs     # wavefold(): sine wavefolder with bypass at zero
         │   └── voice.rs        # Voice: per-voice DSP bundle; allocate_voice(): voice stealing
         └── main.rs         # standalone binary: nih_export_standalone::<SineOne>()
 ```
@@ -380,6 +411,13 @@ Tests live in `#[cfg(test)]` blocks in the same file as the struct under test.
 - `retrigger_preserves_level` — calling `note_on()` mid-attack preserves the current level
 - `retrigger_during_release_preserves_level` — calling `note_on()` mid-release preserves the current level
 
+**`wavefold.rs`:**
+- `zero_fold_is_identity` — fold=0 returns input unchanged
+- `output_bounded` — output stays in [-1, 1] for all valid inputs and fold amounts
+- `max_fold_changes_signal` — fold=1 produces different output than input
+- `fold_is_odd_symmetric` — wavefold(-x, a) == -wavefold(x, a)
+- `negative_fold_treated_as_zero` — fold < 0 bypasses
+
 **`pan.rs`:**
 - `center_pan_equal_channels` — pan=0 produces L == R ≈ sample × 1/√2
 - `hard_left_silences_right` — pan=-1 → right=0, left=sample
@@ -402,6 +440,18 @@ proptest! {
         for _ in 0..512 {
             prop_assert!(osc.next_sample().is_finite());
         }
+    }
+}
+```
+
+**`wavefold.rs`:**
+```rust
+proptest! {
+    fn wavefold_always_bounded(input in -1.0f32..=1.0, fold in 0.0f32..=1.0) {
+        // output is finite and in [-1, 1]
+    }
+    fn zero_fold_always_identity(input in -1.0f32..=1.0) {
+        // fold=0 returns input unchanged
     }
 }
 ```
@@ -589,12 +639,14 @@ cargo run -p sine_one --features standalone -- --output "Built-in Output"
 ### Bitwig Smoke Tests (manual, after install)
 
 1. **Plugin loads** — appears in Bitwig browser under Instruments
-2. **Parameters visible** — Fine Tune, Attack, Release, Start Phase, Voices, Output Gain appear in
-   the device panel with correct ranges and units
+2. **Parameters visible** — Fine Tune, Attack, Release, Start Phase, Fold, Voices, Output Gain
+   appear in the device panel with correct ranges and units
 3. **Note produces sound** — draw a MIDI note; hear a sine tone
 4. **AR envelope audible** — set Attack to 500ms; note should fade in; set Release to 1000ms;
    note should fade out after key release
 5. **Fine tune works** — automate Fine Tune from -100 to +100 cents; pitch should sweep smoothly
+5b. **Fold works** — sweep Fold from 0% to 100%; timbre should go from pure sine to harmonically
+   rich; no zipper noise during automation
 6. **State save/load** — save project, close, reopen; parameters restore correctly
 7. **Smooth retrigger** — rapid MIDI notes should not produce audible clicks or dips to silence
 8. **Pan expression** — add a Randomize device before SineOne; randomize Pan; hear the signal

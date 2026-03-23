@@ -12,6 +12,7 @@ workflow with every design decision documented — not a feature-rich instrument
 - Accepts MIDI NoteOn / NoteOff
 - Plays a sine oscillator tuned to the incoming note and velocity
 - Polyphonic: 1–8 voices with voice stealing (oldest releasing, then oldest active)
+- Sine wavefolder for timbral control — from pure sine (0%) to harmonically rich (100%)
 - Shapes the output with a linear AR (Attack/Release) envelope
 - Responds to **PolyPan** note expression events for stereo panning (e.g., from Bitwig's Randomize device)
 - Attack-gated start-phase transient: short attacks (< 10 ms) allow an intentional amplitude pop from non-zero start phase; long attacks suppress it
@@ -27,6 +28,7 @@ workflow with every design decision documented — not a feature-rich instrument
 | **Attack** | 1–5000 ms | 10 ms | Log-skewed; read at note-on boundaries |
 | **Release** | 1–10000 ms | 300 ms | Log-skewed; read at note-off boundaries |
 | **Start Phase** | 0–360° | 0° | Oscillator phase on NoteOn from silence |
+| **Fold** | 0–100% | 0% | Wavefolder amount; 0 = bypass (pure sine), 100 = max folding |
 | **Voices** | 1–8 | 1 | Polyphonic voice count; 1 = monophonic behavior |
 | **Output Gain** | −24 to +12 dB | 0 dB | Final scaling after voice gain compensation |
 
@@ -71,12 +73,13 @@ sine-one/
     └── src/
         ├── lib.rs          # nih_export_clap! macro entry point
         ├── plugin.rs       # SineOne struct + Plugin trait (initialize, reset, process)
-        ├── params.rs       # SineOneParams — six CLAP parameters
+        ├── params.rs       # SineOneParams — seven CLAP parameters
         ├── main.rs         # standalone binary entry point
         └── dsp/
             ├── mod.rs
             ├── oscillator.rs   # SineOscillator — phase accumulator + frequency math
             ├── envelope.rs     # ArEnvelope — Idle/Attack/Release state machine
+            ├── wavefold.rs     # wavefold() — sine wavefolder with bypass at zero
             ├── voice.rs        # Voice — per-voice DSP path + voice allocation
             ├── pan.rs          # Constant-power stereo panning (sin/cos pan law)
             └── smoother.rs     # LinearSmoother — click-free parameter ramps
@@ -180,12 +183,12 @@ HTML reports are generated in `target/criterion/`.
 After installing and rescanning, verify the following manually:
 
 1. Plugin appears in the Bitwig instrument browser under **SineOne**
-2. All six parameters appear in the device panel with correct ranges
+2. All seven parameters appear in the device panel with correct ranges
 3. A MIDI note produces a sine tone
 4. Attack = 500 ms: note fades in audibly over half a second
 5. Release = 1000 ms: note fades out after key release
 6. Fine Tune automated from −100 to +100 cents: pitch sweeps smoothly, no zipper noise
-7. Save project, close, reopen: all six parameters restore correctly
+7. Save project, close, reopen: all seven parameters restore correctly
 8. Rapid repeated MIDI notes produce no audible clicks
 9. Randomize device → Pan: signal moves in the stereo field between notes
 10. Voices = 4: play a chord — all four notes sound simultaneously
@@ -194,6 +197,7 @@ After installing and rescanning, verify the following manually:
 13. Start Phase = 90°, Attack = 1 ms: note begins with an intentional amplitude pop
 14. Start Phase = 0°, Attack = 1 ms: note begins cleanly (no pop)
 15. Output Gain = −12 dB: output is noticeably quieter than 0 dB
+16. Fold = 50%: tone is audibly different (richer) than Fold = 0%; automation sweeps smoothly
 
 ---
 
