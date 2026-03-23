@@ -2,11 +2,12 @@ use nih_plug::prelude::*;
 
 /// Plugin parameters — user/host-controllable values.
 ///
-/// Five FloatParams and one IntParam that the host (or automation) can control:
+/// Six FloatParams and one IntParam that the host (or automation) can control:
 /// - `fine_tune`: pitch offset in cents (±100 = ±1 semitone)
 /// - `attack`: AR envelope attack time in milliseconds
 /// - `release`: AR envelope release time in milliseconds
 /// - `start_phase`: oscillator phase on NoteOn (0–360°)
+/// - `fold`: wavefolder amount (0–1, 0 = bypass)
 /// - `voices`: polyphonic voice count (1–8)
 /// - `output_gain`: output level in dB (-24 to +12)
 ///
@@ -39,6 +40,11 @@ pub struct SineOneParams {
     /// 0° = sin(0) = 0.0 (cleanest sine start); 90° = sin(π/2) = 1.0 (peak).
     #[id = "start_phase"]
     pub start_phase: FloatParam,
+
+    /// Wavefolder amount (0–1). 0 = bypass (pure sine), 1 = maximum folding.
+    /// Smoothed at 20 ms to avoid zipper noise when automated.
+    #[id = "fold"]
+    pub fold: FloatParam,
 
     /// Number of polyphonic voices (1–8).
     /// At 1, the plugin behaves identically to monophonic mode.
@@ -97,6 +103,8 @@ impl Default for SineOneParams {
 
             start_phase: Self::build_start_phase(0.0),
 
+            fold: Self::build_fold(0.0),
+
             voices: Self::build_voices(1),
 
             output_gain: Self::build_output_gain(0.0),
@@ -126,6 +134,18 @@ impl SineOneParams {
         )
         .with_unit(" dB")
         .with_step_size(0.1)
+    }
+
+    /// Build the fold FloatParam with the given default value.
+    /// Shared between `Default` and the test helper to avoid duplicating
+    /// range, unit, smoother, and step_size definitions.
+    fn build_fold(default: f32) -> FloatParam {
+        FloatParam::new("Fold", default, FloatRange::Linear { min: 0.0, max: 1.0 })
+            .with_smoother(SmoothingStyle::Linear(20.0))
+            .with_unit(" %")
+            .with_step_size(0.01)
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage())
     }
 
     /// Build the start_phase FloatParam with the given default value.
@@ -167,6 +187,13 @@ impl SineOneParams {
     pub fn with_output_gain(db: f32) -> Self {
         let mut params = Self::default();
         params.output_gain = Self::build_output_gain(db);
+        params
+    }
+
+    /// Create params with a custom fold amount (0–1) for testing.
+    pub fn with_fold(fold: f32) -> Self {
+        let mut params = Self::default();
+        params.fold = Self::build_fold(fold);
         params
     }
 }
@@ -221,6 +248,14 @@ mod tests {
         );
         assert_eq!(voices_val, 1, "voices default should be 1");
 
+        // Fold: range 0..1, default 0.0
+        let fold_val = params.fold.value();
+        assert!(
+            (0.0..=1.0).contains(&fold_val),
+            "fold default {fold_val} out of range"
+        );
+        assert_eq!(fold_val, 0.0, "fold default should be 0.0");
+
         // Output Gain: range -24..+12 dB, default 0.0
         let og_val = params.output_gain.value();
         assert!(
@@ -274,6 +309,14 @@ mod tests {
         let v_plain = params.voices.preview_plain(v_norm);
         assert_eq!(v_plain, 1, "voices round-trip: expected 1, got {v_plain}");
 
+        // Fold: Linear 0..1, default 0.0.
+        let fold_norm = params.fold.preview_normalized(0.0);
+        let fold_plain = params.fold.preview_plain(fold_norm);
+        assert!(
+            (fold_plain - 0.0).abs() < 0.01,
+            "fold round-trip: expected 0.0, got {fold_plain}"
+        );
+
         // Output Gain: Linear -24..+12, default 0.0.
         let og_norm = params.output_gain.preview_normalized(0.0);
         let og_plain = params.output_gain.preview_plain(og_norm);
@@ -322,6 +365,13 @@ mod tests {
         assert!(
             v_norm.abs() < 1e-6,
             "voices normalized default: expected 0.0, got {v_norm}"
+        );
+
+        // Fold: Linear 0..1, default 0.0 → normalized 0.0.
+        let fold_norm = params.fold.default_normalized_value();
+        assert!(
+            fold_norm.abs() < 1e-6,
+            "fold normalized default: expected 0.0, got {fold_norm}"
         );
 
         // Output Gain: Linear -24..+12, default 0.0 → normalized 24/36 ≈ 0.667.
