@@ -4,6 +4,7 @@ use sine_one::dsp::envelope::ArEnvelope;
 use sine_one::dsp::oscillator::{apply_detune, SineOscillator};
 use sine_one::dsp::smoother::LinearSmoother;
 use sine_one::dsp::voice::{NoteOnParams, Voice, MAX_VOICES};
+use sine_one::dsp::wavefold::wavefold;
 
 const SAMPLE_RATE: f32 = 44100.0;
 const BUFFER_SIZE: usize = 512;
@@ -108,6 +109,18 @@ fn component_benchmarks(c: &mut Criterion) {
                 let osc_sample = osc.next_sample();
                 let env_sample = env.next_sample();
                 black_box(osc_sample * env_sample * velocity);
+            }
+        });
+    });
+
+    group.bench_function("wavefold_512", |b| {
+        let mut osc = SineOscillator::default();
+        osc.set_frequency(440.0, SAMPLE_RATE);
+        b.iter(|| {
+            for _ in 0..BUFFER_SIZE {
+                let sample = osc.next_sample();
+                // black_box fold_amount to prevent constant-folding the sin().
+                black_box(wavefold(sample, black_box(0.5)));
             }
         });
     });
