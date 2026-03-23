@@ -407,6 +407,28 @@ mod tests {
         (sum / samples.len() as f32).sqrt()
     }
 
+    /// Shorthand for constructing a NoteOn event on channel 0 with no voice ID.
+    fn note_on(timing: u32, note: u8, velocity: f32) -> NoteEvent<()> {
+        NoteEvent::NoteOn {
+            timing,
+            voice_id: None,
+            channel: 0,
+            note,
+            velocity,
+        }
+    }
+
+    /// Shorthand for constructing a NoteOff event on channel 0 with no voice ID.
+    fn note_off(timing: u32, note: u8) -> NoteEvent<()> {
+        NoteEvent::NoteOff {
+            timing,
+            voice_id: None,
+            channel: 0,
+            note,
+            velocity: 0.0,
+        }
+    }
+
     #[test]
     fn plugin_can_be_constructed() {
         let plugin = SineOne::default();
@@ -1316,6 +1338,62 @@ mod tests {
         assert!(
             (ratio - 2.0).abs() < 0.3,
             "output at +6 dB should be ~double 0 dB, ratio was {ratio}"
+        );
+    }
+
+    #[test]
+    fn voice_count_reduction_releases_excess_voices() {
+        let mut plugin = init_plugin_with_voices(44100.0, 4);
+
+        // Play 4 notes — one per voice slot.
+        let events = vec![
+            note_on(0, 60, 1.0),
+            note_on(0, 64, 1.0),
+            note_on(0, 67, 1.0),
+            note_on(0, 72, 1.0),
+        ];
+        run_process(&mut plugin, 256, events);
+
+        // All 4 voices should be active.
+        for (i, voice) in plugin.voices[..4].iter().enumerate() {
+            assert!(
+                !voice.is_idle(),
+                "voice {i} should be active before reduction"
+            );
+        }
+
+        // Reduce voice count from 4 to 2 by swapping in new params.
+        // NOTE: This replaces *all* params (not just voices) because nih-plug's
+        // ParamMut::set_plain_value is pub(crate). Other params reset to defaults,
+        // which is acceptable here because only voice count is checked.
+        plugin.params = Arc::new(SineOneParams::with_voices(2));
+
+        // Process another block — the reduction path should release voices 2 and 3.
+        run_process(&mut plugin, 256, vec![]);
+
+        // Voices beyond the new count should be releasing (or idle if release completed).
+        for i in 2..4 {
+            assert!(
+                plugin.voices[i].is_releasing() || plugin.voices[i].is_idle(),
+                "voice {i} should be releasing or idle after voice count reduction"
+            );
+        }
+    }
+
+    #[test]
+    fn note_off_for_unplayed_note_is_noop() {
+        let mut plugin = init_plugin(44100.0);
+
+        // Play a note.
+        run_process(&mut plugin, 256, vec![note_on(0, 69, 1.0)]);
+
+        // Send NoteOff for a note that was never played.
+        let (left_after, _) = run_process(&mut plugin, 256, vec![note_off(0, 42)]);
+
+        // The active voice (note 69) should still be producing output.
+        assert!(
+            left_after.iter().any(|&s| s != 0.0),
+            "NoteOff for unplayed note should not silence active voices"
         );
     }
 }

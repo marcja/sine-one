@@ -26,6 +26,9 @@
 **/*.profraw
 **/*.profdata
 
+# cargo-tarpaulin coverage reports
+tarpaulin-report.*
+
 # cargo-fuzz artifacts
 fuzz/artifacts/
 fuzz/corpus/

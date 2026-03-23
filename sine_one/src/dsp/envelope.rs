@@ -596,6 +596,40 @@ mod tests {
     }
 
     #[test]
+    fn note_off_while_idle_stays_idle() {
+        let mut env = make_envelope(10.0, 100.0);
+        assert!(env.is_idle(), "fresh envelope should be idle");
+
+        env.note_off();
+
+        assert!(
+            env.is_idle(),
+            "note_off on idle envelope should remain idle"
+        );
+        assert_eq!(env.next_sample(), 0.0, "idle envelope should output 0.0");
+    }
+
+    #[test]
+    fn note_off_at_zero_level_goes_idle() {
+        let mut env = make_envelope(10.0, 100.0);
+        // Enter attack but don't advance — level is still 0.0.
+        env.note_on();
+        assert_eq!(
+            env.level, 0.0,
+            "level should be 0.0 immediately after note_on"
+        );
+
+        // Immediately release before any next_sample() call.
+        env.note_off();
+
+        assert!(
+            env.is_idle(),
+            "note_off at zero level should go straight to Idle"
+        );
+        assert_eq!(env.next_sample(), 0.0, "idle envelope should output 0.0");
+    }
+
+    #[test]
     fn reset_clears_derived_increments() {
         let mut env = make_envelope(10.0, 100.0);
         env.note_on();
