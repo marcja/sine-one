@@ -3,6 +3,7 @@ use nih_plug::util;
 use sine_one::dsp::envelope::ArEnvelope;
 use sine_one::dsp::oscillator::{apply_detune, SineOscillator};
 use sine_one::dsp::smoother::LinearSmoother;
+use sine_one::dsp::svf::{compute_lpg_cutoff, resonance_to_q, SvfFilter, MAX_CUTOFF_HZ};
 use sine_one::dsp::voice::{NoteOnParams, Voice, MAX_VOICES};
 use sine_one::dsp::wavefold::wavefold;
 
@@ -25,7 +26,7 @@ fn make_voice(note: u8, pan: f32, age: u64) -> Voice {
     voice.set_pan(pan, SAMPLE_RATE);
     // Warm up past pan ramp (~88 samples) and attack phase (441 samples).
     for _ in 0..BUFFER_SIZE {
-        voice.render_sample(0.0, 0.0, SAMPLE_RATE);
+        voice.render_sample(0.0, 0.0, 0.0, MAX_CUTOFF_HZ, 0.0, SAMPLE_RATE);
     }
     voice
 }
@@ -47,7 +48,8 @@ fn render_buffer(voices: &mut [Voice], gain_smoother: &mut LinearSmoother) {
         let mut left_sum = 0.0_f32;
         let mut right_sum = 0.0_f32;
         for voice in voices.iter_mut() {
-            let (l, r) = voice.render_sample(FINE_TUNE_CENTS, 0.0, SAMPLE_RATE);
+            let (l, r) =
+                voice.render_sample(FINE_TUNE_CENTS, 0.0, 0.0, MAX_CUTOFF_HZ, 0.0, SAMPLE_RATE);
             left_sum += l;
             right_sum += r;
         }
@@ -125,6 +127,21 @@ fn component_benchmarks(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("svf_filter_512", |b| {
+        let mut svf = SvfFilter::default();
+        let mut osc = SineOscillator::default();
+        osc.set_frequency(440.0, SAMPLE_RATE);
+        b.iter(|| {
+            for _ in 0..BUFFER_SIZE {
+                let sample = osc.next_sample();
+                // black_box cutoff/Q to prevent constant-folding the tan().
+                let fc = compute_lpg_cutoff(black_box(0.8), 1.0, 5000.0);
+                let q = resonance_to_q(black_box(0.3));
+                black_box(svf.process(sample, fc, q, SAMPLE_RATE));
+            }
+        });
+    });
+
     group.bench_function("apply_detune_512", |b| {
         b.iter(|| {
             for _ in 0..BUFFER_SIZE {
@@ -152,7 +169,23 @@ fn voice_benchmarks(c: &mut Criterion) {
         let mut voice = make_voice(60, 0.0, 1);
         b.iter(|| {
             for _ in 0..BUFFER_SIZE {
-                black_box(voice.render_sample(FINE_TUNE_CENTS, 0.0, SAMPLE_RATE));
+                black_box(voice.render_sample(
+                    FINE_TUNE_CENTS,
+                    0.0,
+                    0.0,
+                    MAX_CUTOFF_HZ,
+                    0.0,
+                    SAMPLE_RATE,
+                ));
+            }
+        });
+    });
+
+    group.bench_function("single_voice_lpg_512", |b| {
+        let mut voice = make_voice(60, 0.0, 1);
+        b.iter(|| {
+            for _ in 0..BUFFER_SIZE {
+                black_box(voice.render_sample(FINE_TUNE_CENTS, 0.0, 1.0, 5000.0, 0.3, SAMPLE_RATE));
             }
         });
     });
