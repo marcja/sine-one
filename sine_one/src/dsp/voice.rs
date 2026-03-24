@@ -2,6 +2,7 @@ use super::envelope::ArEnvelope;
 use super::oscillator::{apply_detune, SineOscillator};
 use super::pan::apply_constant_power_pan;
 use super::smoother::LinearSmoother;
+use super::svf::{compute_lpg_cutoff, resonance_to_q, SvfFilter};
 use super::wavefold::wavefold;
 
 fn center_pan_gains() -> (f32, f32) {
@@ -56,6 +57,7 @@ pub struct NoteOnParams {
 pub struct Voice {
     osc: SineOscillator,
     env: ArEnvelope,
+    svf: SvfFilter,
     velocity_smoother: LinearSmoother,
     /// The MIDI note this voice is currently playing, or `None` if idle.
     note: Option<u8>,
@@ -84,6 +86,7 @@ impl Default for Voice {
         Self {
             osc: SineOscillator::default(),
             env: ArEnvelope::default(),
+            svf: SvfFilter::default(),
             velocity_smoother: LinearSmoother::default(),
             note: None,
             base_freq: 0.0,
@@ -200,15 +203,18 @@ impl Voice {
 
     /// Generate one stereo sample from this voice.
     ///
-    /// Applies fine-tune detune to the base frequency, runs the oscillator
-    /// through the wavefolder, multiplies by envelope and velocity, then
-    /// applies constant-power stereo panning.
+    /// Signal chain: oscillator → wavefold → LPG filter → envelope × velocity → pan.
+    /// The envelope level is sampled once and used for both the LPG cutoff
+    /// calculation and the amplitude multiplication.
     ///
     /// Returns `(left, right)`. Returns `(0.0, 0.0)` when idle.
     pub fn render_sample(
         &mut self,
         fine_tune_cents: f32,
         fold: f32,
+        lpg_depth: f32,
+        lpg_cutoff_hz: f32,
+        lpg_resonance: f32,
         sample_rate: f32,
     ) -> (f32, f32) {
         if self.env.is_idle() {
@@ -219,12 +225,24 @@ impl Voice {
         let freq = apply_detune(self.base_freq, fine_tune_cents);
         self.osc.set_frequency(freq, sample_rate);
 
-        // Generate audio: oscillator → wavefold → envelope × velocity.
+        // Generate audio: oscillator → wavefold.
         let osc_sample = self.osc.next_sample();
         let folded = wavefold(osc_sample, fold);
-        let env_sample = self.env.next_sample();
+
+        // Sample envelope level once — used for both LPG cutoff and amplitude.
+        let env_level = self.env.next_sample();
+
+        // Apply LPG filter when depth > 0. Bypass avoids unnecessary tan() call.
+        let filtered = if lpg_depth > 0.0 {
+            let fc = compute_lpg_cutoff(env_level, lpg_depth, lpg_cutoff_hz);
+            let q = resonance_to_q(lpg_resonance);
+            self.svf.process(folded, fc, q, sample_rate)
+        } else {
+            folded
+        };
+
         let velocity = self.velocity_smoother.next_sample();
-        let mono_output = folded * env_sample * velocity;
+        let mono_output = filtered * env_level * velocity;
 
         let pan_left = self.pan_left_smoother.next_sample();
         let pan_right = self.pan_right_smoother.next_sample();
@@ -235,6 +253,7 @@ impl Voice {
     pub fn reset(&mut self) {
         self.osc.reset();
         self.env.reset();
+        self.svf.reset();
         self.velocity_smoother.reset();
         self.note = None;
         self.base_freq = 0.0;
@@ -297,9 +316,15 @@ mod tests {
     use super::*;
     use nih_plug::util;
 
+    use super::super::svf::MAX_CUTOFF_HZ;
+
     const SR: f32 = 44100.0;
     const A4_FREQ: f32 = 440.0;
     const A4_NOTE: u8 = 69;
+
+    /// LPG-off render args: (lpg_depth, lpg_cutoff_hz, lpg_resonance).
+    /// Used in tests that don't exercise the LPG to make the bypass intent explicit.
+    const LPG_OFF: (f32, f32, f32) = (0.0, MAX_CUTOFF_HZ, 0.0);
 
     /// Helper: trigger a note on a voice with standard test parameters (10ms attack).
     fn trigger_voice(voice: &mut Voice, note: u8, velocity: f32, start_phase_norm: f32) {
@@ -324,7 +349,7 @@ mod tests {
         // Render several samples and check for nonzero output.
         let mut found_nonzero = false;
         for _ in 0..100 {
-            let (l, r) = voice.render_sample(0.0, 0.0, SR);
+            let (l, r) = voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
             if l != 0.0 || r != 0.0 {
                 found_nonzero = true;
                 break;
@@ -344,7 +369,7 @@ mod tests {
         // Advance through attack.
         let attack_samples = (10.0 * SR / 1000.0) as usize;
         for _ in 0..attack_samples + 10 {
-            voice.render_sample(0.0, 0.0, SR);
+            voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
 
         voice.note_off(100.0, SR);
@@ -357,7 +382,7 @@ mod tests {
         // Complete release.
         let release_samples = (100.0 * SR / 1000.0) as usize;
         for _ in 0..release_samples + 10 {
-            voice.render_sample(0.0, 0.0, SR);
+            voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
         assert!(
             voice.is_idle(),
@@ -370,7 +395,7 @@ mod tests {
         let mut voice = Voice::default();
         trigger_voice(&mut voice, A4_NOTE, 0.8, 0.0);
         for _ in 0..100 {
-            voice.render_sample(0.0, 0.0, SR);
+            voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
 
         voice.reset();
@@ -380,7 +405,7 @@ mod tests {
         assert_eq!(voice.age(), 0, "age should be 0 after reset");
 
         // Should produce silence.
-        let (l, r) = voice.render_sample(0.0, 0.0, SR);
+        let (l, r) = voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         assert_eq!((l, r), (0.0, 0.0), "reset voice should output silence");
     }
 
@@ -394,14 +419,14 @@ mod tests {
         // Render through the pan ramp so gains have settled.
         let ramp_warmup = (PAN_RAMP_SECS * SR) as usize + 10;
         for _ in 0..ramp_warmup {
-            voice.render_sample(0.0, 0.0, SR);
+            voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
 
         // Now measure stereo balance after ramp has completed.
         let mut left_sum = 0.0_f32;
         let mut right_sum = 0.0_f32;
         for _ in 0..50 {
-            let (l, r) = voice.render_sample(0.0, 0.0, SR);
+            let (l, r) = voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
             left_sum += l.abs();
             right_sum += r.abs();
         }
@@ -424,7 +449,7 @@ mod tests {
 
         // Advance to build up some state.
         for _ in 0..200 {
-            voice.render_sample(0.0, 0.0, SR);
+            voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
 
         // Retrigger at 0° start phase — should NOT reset phase.
@@ -460,7 +485,7 @@ mod tests {
 
         // Advance to build up some state.
         for _ in 0..200 {
-            voice.render_sample(0.0, 0.0, SR);
+            voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
         assert!(!voice.is_idle());
 
@@ -507,7 +532,7 @@ mod tests {
         // Advance through attack so release has a nonzero level.
         let attack_samples = (10.0 * SR / 1000.0) as usize;
         for _ in 0..attack_samples + 10 {
-            v.render_sample(0.0, 0.0, SR);
+            v.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
         v.note_off(100.0, SR);
         v
@@ -598,7 +623,7 @@ mod tests {
 
         // First render_sample should produce non-negligible output because
         // the envelope starts at initial_level = |sin(90°)| * 1.0 = 1.0.
-        let (l, r) = voice.render_sample(0.0, 0.0, SR);
+        let (l, r) = voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         let mono = l.abs().max(r.abs());
         assert!(
             mono > 0.5,
@@ -613,7 +638,7 @@ mod tests {
         trigger_voice_with_attack(&mut voice, A4_NOTE, 1.0, 0.25, 500.0);
 
         // First sample should be near zero — long attack suppresses the transient.
-        let (l, r) = voice.render_sample(0.0, 0.0, SR);
+        let (l, r) = voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         let mono = l.abs().max(r.abs());
         assert!(
             mono < 0.01,
@@ -628,7 +653,7 @@ mod tests {
         trigger_voice_with_attack(&mut voice, A4_NOTE, 1.0, 0.0, 1.0);
 
         // First sample should be near zero — sin(0°) = 0, no transient regardless.
-        let (l, r) = voice.render_sample(0.0, 0.0, SR);
+        let (l, r) = voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         let mono = l.abs().max(r.abs());
         assert!(
             mono < 0.01,
@@ -647,14 +672,14 @@ mod tests {
         voice.set_pan(-1.0, SR);
         let ramp_samples = (PAN_RAMP_SECS * SR) as usize + 10;
         for _ in 0..ramp_samples {
-            voice.render_sample(0.0, 0.0, SR);
+            voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
 
         // Now switch to hard-right. On the very first sample after the change,
         // the left channel should NOT be zero — it should still be near the old
         // hard-left gain, proving the pan is smoothed rather than instant.
         voice.set_pan(1.0, SR);
-        let (left, _right) = voice.render_sample(0.0, 0.0, SR);
+        let (left, _right) = voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         assert!(
             left.abs() > 0.01,
             "first sample after pan change should not be zero (smoothing), got left={left}"
@@ -670,14 +695,14 @@ mod tests {
         voice.set_pan(1.0, SR);
         let ramp_samples = (PAN_RAMP_SECS * SR) as usize + 20;
         for _ in 0..ramp_samples {
-            voice.render_sample(0.0, 0.0, SR);
+            voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
 
         // After the ramp completes, left should be ~0 (hard-right pan).
         let mut left_sum = 0.0_f32;
         let mut right_sum = 0.0_f32;
         for _ in 0..50 {
-            let (l, r) = voice.render_sample(0.0, 0.0, SR);
+            let (l, r) = voice.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
             left_sum += l.abs();
             right_sum += r.abs();
         }
@@ -705,15 +730,15 @@ mod tests {
         // Advance both through attack.
         let attack_samples = (10.0 * SR / 1000.0) as usize + 10;
         for _ in 0..attack_samples {
-            voice_dry.render_sample(0.0, 0.0, SR);
-            voice_wet.render_sample(0.0, 0.5, SR);
+            voice_dry.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
+            voice_wet.render_sample(0.0, 0.5, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
         }
 
         // Compare several samples in the hold phase.
         let mut any_differ = false;
         for _ in 0..100 {
-            let (dl, _) = voice_dry.render_sample(0.0, 0.0, SR);
-            let (wl, _) = voice_wet.render_sample(0.0, 0.5, SR);
+            let (dl, _) = voice_dry.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
+            let (wl, _) = voice_wet.render_sample(0.0, 0.5, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
             if (dl - wl).abs() > 1e-6 {
                 any_differ = true;
                 break;
@@ -723,5 +748,90 @@ mod tests {
             any_differ,
             "fold=0.5 should produce different output than fold=0"
         );
+    }
+
+    // --- LPG tests ---
+
+    #[test]
+    fn voice_render_lpg_zero_depth_matches_bypass() {
+        // Two identical voices: one with explicit lpg=0, one with default args.
+        // Output should be identical since lpg_depth=0 bypasses the SVF.
+        let mut voice_a = Voice::default();
+        let mut voice_b = Voice::default();
+        trigger_voice(&mut voice_a, A4_NOTE, 1.0, 0.0);
+        trigger_voice(&mut voice_b, A4_NOTE, 1.0, 0.0);
+
+        let attack_samples = (10.0 * SR / 1000.0) as usize + 10;
+        for _ in 0..attack_samples {
+            voice_a.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
+            voice_b.render_sample(0.0, 0.0, 0.0, 500.0, 0.5, SR);
+        }
+
+        // In the hold phase, both should produce identical output because
+        // lpg_depth=0 bypasses the filter regardless of cutoff/resonance.
+        for _ in 0..100 {
+            let (al, ar) = voice_a.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
+            let (bl, br) = voice_b.render_sample(0.0, 0.0, 0.0, 500.0, 0.5, SR);
+            assert_eq!((al, ar), (bl, br), "lpg_depth=0 should bypass filter");
+        }
+    }
+
+    #[test]
+    fn voice_render_lpg_darkens_output() {
+        // With lpg=1.0 and low cutoff, output should differ from lpg=0.
+        let mut voice_dry = Voice::default();
+        let mut voice_lpg = Voice::default();
+        trigger_voice(&mut voice_dry, A4_NOTE, 1.0, 0.0);
+        trigger_voice(&mut voice_lpg, A4_NOTE, 1.0, 0.0);
+
+        // Advance through attack to hold phase.
+        let attack_samples = (10.0 * SR / 1000.0) as usize + 10;
+        for _ in 0..attack_samples {
+            voice_dry.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
+            voice_lpg.render_sample(0.0, 0.0, 1.0, 500.0, 0.0, SR);
+        }
+
+        // Compare samples — they should differ since the LPG filter is active.
+        let mut any_differ = false;
+        for _ in 0..100 {
+            let (dl, _) = voice_dry.render_sample(0.0, 0.0, LPG_OFF.0, LPG_OFF.1, LPG_OFF.2, SR);
+            let (wl, _) = voice_lpg.render_sample(0.0, 0.0, 1.0, 500.0, 0.0, SR);
+            if (dl - wl).abs() > 1e-6 {
+                any_differ = true;
+                break;
+            }
+        }
+        assert!(
+            any_differ,
+            "lpg=1.0 with 500Hz cutoff should produce different output than lpg=0"
+        );
+    }
+
+    #[test]
+    fn voice_reset_clears_svf() {
+        let mut voice = Voice::default();
+        trigger_voice(&mut voice, A4_NOTE, 1.0, 0.0);
+
+        // Process with LPG active to dirty SVF state.
+        for _ in 0..100 {
+            voice.render_sample(0.0, 0.0, 1.0, 1000.0, 0.5, SR);
+        }
+
+        voice.reset();
+
+        // After reset, the SVF state should be zero. Verify by checking that
+        // a fresh voice and a reset voice produce the same output.
+        let mut fresh = Voice::default();
+        trigger_voice(&mut voice, A4_NOTE, 1.0, 0.0);
+        trigger_voice(&mut fresh, A4_NOTE, 1.0, 0.0);
+
+        for _ in 0..50 {
+            let (rl, rr) = voice.render_sample(0.0, 0.0, 1.0, 1000.0, 0.0, SR);
+            let (fl, fr) = fresh.render_sample(0.0, 0.0, 1.0, 1000.0, 0.0, SR);
+            assert!(
+                (rl - fl).abs() < 1e-6 && (rr - fr).abs() < 1e-6,
+                "reset voice should match fresh voice: reset=({rl},{rr}) fresh=({fl},{fr})"
+            );
+        }
     }
 }

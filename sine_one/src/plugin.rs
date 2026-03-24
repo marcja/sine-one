@@ -216,6 +216,9 @@ impl Plugin for SineOne {
             // The smoothers must be consumed every sample even when no note is active.
             let fine_tune_cents = self.params.fine_tune.smoothed.next();
             let fold = self.params.fold.smoothed.next();
+            let lpg_depth = self.params.lpg.smoothed.next();
+            let lpg_cutoff = self.params.lpg_cutoff.smoothed.next();
+            let lpg_resonance = self.params.lpg_resonance.smoothed.next();
             let gain = self.gain_smoother.next_sample();
 
             // Sum all active voices.
@@ -223,7 +226,14 @@ impl Plugin for SineOne {
             let mut right_sum = 0.0_f32;
             for voice in &mut self.voices {
                 if !voice.is_idle() {
-                    let (l, r) = voice.render_sample(fine_tune_cents, fold, self.sample_rate);
+                    let (l, r) = voice.render_sample(
+                        fine_tune_cents,
+                        fold,
+                        lpg_depth,
+                        lpg_cutoff,
+                        lpg_resonance,
+                        self.sample_rate,
+                    );
                     left_sum += l;
                     right_sum += r;
                 }
