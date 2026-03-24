@@ -1,13 +1,17 @@
+use crate::dsp::svf::{MAX_CUTOFF_HZ, MIN_CUTOFF_HZ};
 use nih_plug::prelude::*;
 
 /// Plugin parameters — user/host-controllable values.
 ///
-/// Six FloatParams and one IntParam that the host (or automation) can control:
+/// Nine FloatParams and one IntParam that the host (or automation) can control:
 /// - `fine_tune`: pitch offset in cents (±100 = ±1 semitone)
 /// - `attack`: AR envelope attack time in milliseconds
 /// - `release`: AR envelope release time in milliseconds
 /// - `start_phase`: oscillator phase on NoteOn (0–360°)
 /// - `fold`: wavefolder amount (0–1, 0 = bypass)
+/// - `lpg`: LPG envelope-to-cutoff depth (0–1, 0 = bypass)
+/// - `lpg_cutoff`: LPG maximum cutoff frequency in Hz
+/// - `lpg_resonance`: LPG SVF resonance (0–1)
 /// - `voices`: polyphonic voice count (1–8)
 /// - `output_gain`: output level in dB (-24 to +12)
 ///
@@ -45,6 +49,24 @@ pub struct SineOneParams {
     /// Smoothed at 20 ms to avoid zipper noise when automated.
     #[id = "fold"]
     pub fold: FloatParam,
+
+    /// LPG envelope-to-cutoff depth (0–1). At 0 the SVF is bypassed entirely.
+    /// At 1 the filter cutoff fully tracks the AR envelope level.
+    /// Smoothed at 20 ms — read per-sample in `process()`.
+    #[id = "lpg"]
+    pub lpg: FloatParam,
+
+    /// LPG maximum cutoff frequency (Hz). The SVF opens up to this frequency
+    /// when the envelope is at 1.0. Default 20 kHz (fully open).
+    /// Smoothed at 20 ms — read per-sample in `process()`.
+    #[id = "lpg_cutoff"]
+    pub lpg_cutoff: FloatParam,
+
+    /// LPG SVF resonance (0–1). Controls the resonant peak at cutoff.
+    /// 0 = Butterworth (flat passband), 1 = strong resonant peak.
+    /// Smoothed at 20 ms — read per-sample in `process()`.
+    #[id = "lpg_resonance"]
+    pub lpg_resonance: FloatParam,
 
     /// Number of polyphonic voices (1–8).
     /// At 1, the plugin behaves identically to monophonic mode.
@@ -105,6 +127,10 @@ impl Default for SineOneParams {
 
             fold: Self::build_fold(0.0),
 
+            lpg: Self::build_lpg(0.0),
+            lpg_cutoff: Self::build_lpg_cutoff(MAX_CUTOFF_HZ),
+            lpg_resonance: Self::build_lpg_resonance(0.0),
+
             voices: Self::build_voices(1),
 
             output_gain: Self::build_output_gain(0.0),
@@ -148,6 +174,48 @@ impl SineOneParams {
             .with_string_to_value(formatters::s2v_f32_percentage())
     }
 
+    /// Build the lpg FloatParam with the given default value.
+    fn build_lpg(default: f32) -> FloatParam {
+        FloatParam::new("LPG", default, FloatRange::Linear { min: 0.0, max: 1.0 })
+            .with_smoother(SmoothingStyle::Linear(20.0))
+            .with_unit(" %")
+            .with_step_size(0.01)
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage())
+    }
+
+    /// Build the lpg_cutoff FloatParam with the given default value.
+    fn build_lpg_cutoff(default_hz: f32) -> FloatParam {
+        FloatParam::new(
+            "LPG Cutoff",
+            default_hz,
+            FloatRange::Skewed {
+                min: MIN_CUTOFF_HZ,
+                max: MAX_CUTOFF_HZ,
+                // Negative factor spreads the low end of the frequency range,
+                // where perceptual differences are largest (20–500 Hz).
+                factor: FloatRange::skew_factor(-2.0),
+            },
+        )
+        .with_smoother(SmoothingStyle::Linear(20.0))
+        .with_unit(" Hz")
+        .with_step_size(1.0)
+    }
+
+    /// Build the lpg_resonance FloatParam with the given default value.
+    fn build_lpg_resonance(default: f32) -> FloatParam {
+        FloatParam::new(
+            "LPG Resonance",
+            default,
+            FloatRange::Linear { min: 0.0, max: 1.0 },
+        )
+        .with_smoother(SmoothingStyle::Linear(20.0))
+        .with_unit(" %")
+        .with_step_size(0.01)
+        .with_value_to_string(formatters::v2s_f32_percentage(0))
+        .with_string_to_value(formatters::s2v_f32_percentage())
+    }
+
     /// Build the start_phase FloatParam with the given default value.
     /// Shared between `Default` and the test helper to avoid duplicating
     /// range, unit, and step_size definitions.
@@ -187,6 +255,27 @@ impl SineOneParams {
     pub fn with_output_gain(db: f32) -> Self {
         let mut params = Self::default();
         params.output_gain = Self::build_output_gain(db);
+        params
+    }
+
+    /// Create params with a custom LPG depth for testing.
+    pub fn with_lpg(depth: f32) -> Self {
+        let mut params = Self::default();
+        params.lpg = Self::build_lpg(depth);
+        params
+    }
+
+    /// Create params with a custom LPG cutoff (Hz) for testing.
+    pub fn with_lpg_cutoff(hz: f32) -> Self {
+        let mut params = Self::default();
+        params.lpg_cutoff = Self::build_lpg_cutoff(hz);
+        params
+    }
+
+    /// Create params with a custom LPG resonance for testing.
+    pub fn with_lpg_resonance(res: f32) -> Self {
+        let mut params = Self::default();
+        params.lpg_resonance = Self::build_lpg_resonance(res);
         params
     }
 }
@@ -256,6 +345,30 @@ mod tests {
             "output_gain default {og_val} out of range"
         );
         assert_eq!(og_val, 0.0, "output_gain default should be 0.0 dB");
+
+        // LPG: range 0..1, default 0.0
+        let lpg_val = params.lpg.value();
+        assert!(
+            (0.0..=1.0).contains(&lpg_val),
+            "lpg default {lpg_val} out of range"
+        );
+        assert_eq!(lpg_val, 0.0, "lpg default should be 0.0");
+
+        // LPG Cutoff: range 20..20000 Hz, default 20000.0
+        let lc_val = params.lpg_cutoff.value();
+        assert!(
+            (20.0..=20000.0).contains(&lc_val),
+            "lpg_cutoff default {lc_val} out of range"
+        );
+        assert_eq!(lc_val, 20000.0, "lpg_cutoff default should be 20000.0 Hz");
+
+        // LPG Resonance: range 0..1, default 0.0
+        let lr_val = params.lpg_resonance.value();
+        assert!(
+            (0.0..=1.0).contains(&lr_val),
+            "lpg_resonance default {lr_val} out of range"
+        );
+        assert_eq!(lr_val, 0.0, "lpg_resonance default should be 0.0");
     }
 
     /// Verify that default values survive a normalize→unnormalize round-trip.
@@ -317,6 +430,30 @@ mod tests {
             (og_plain - 0.0).abs() < 0.01,
             "output_gain round-trip: expected 0.0, got {og_plain}"
         );
+
+        // LPG: Linear 0..1, default 0.0.
+        let lpg_norm = params.lpg.preview_normalized(0.0);
+        let lpg_plain = params.lpg.preview_plain(lpg_norm);
+        assert!(
+            (lpg_plain - 0.0).abs() < 0.01,
+            "lpg round-trip: expected 0.0, got {lpg_plain}"
+        );
+
+        // LPG Cutoff: Skewed 20..20000, default 20000.0.
+        let lc_norm = params.lpg_cutoff.preview_normalized(20000.0);
+        let lc_plain = params.lpg_cutoff.preview_plain(lc_norm);
+        assert!(
+            (lc_plain - 20000.0).abs() < 1.0,
+            "lpg_cutoff round-trip: expected 20000.0, got {lc_plain}"
+        );
+
+        // LPG Resonance: Linear 0..1, default 0.0.
+        let lr_norm = params.lpg_resonance.preview_normalized(0.0);
+        let lr_plain = params.lpg_resonance.preview_plain(lr_norm);
+        assert!(
+            (lr_plain - 0.0).abs() < 0.01,
+            "lpg_resonance round-trip: expected 0.0, got {lr_plain}"
+        );
     }
 
     /// Verify that the normalized default values reported to the CLAP host
@@ -372,6 +509,27 @@ mod tests {
         assert!(
             (og_norm - 24.0 / 36.0).abs() < 1e-4,
             "output_gain normalized default: expected ~0.667, got {og_norm}"
+        );
+
+        // LPG: Linear 0..1, default 0.0 → normalized 0.0.
+        let lpg_norm = params.lpg.default_normalized_value();
+        assert!(
+            lpg_norm.abs() < 1e-6,
+            "lpg normalized default: expected 0.0, got {lpg_norm}"
+        );
+
+        // LPG Cutoff: Skewed 20..20000, default 20000.0 → normalized ~1.0.
+        let lc_norm = params.lpg_cutoff.default_normalized_value();
+        assert!(
+            (lc_norm - 1.0).abs() < 1e-4,
+            "lpg_cutoff normalized default: expected ~1.0, got {lc_norm}"
+        );
+
+        // LPG Resonance: Linear 0..1, default 0.0 → normalized 0.0.
+        let lr_norm = params.lpg_resonance.default_normalized_value();
+        assert!(
+            lr_norm.abs() < 1e-6,
+            "lpg_resonance normalized default: expected 0.0, got {lr_norm}"
         );
     }
 }
