@@ -99,8 +99,8 @@ noise when automated. The smoothed value is read per-sample in `process()`.
 
 ### ArEnvelope
 
-A three-state linear envelope (`EnvState::Idle`, `Attack`, `Release`). "Holding" is not a
-distinct state — it is the Attack state with level clamped at 1.0.
+A three-state exponential envelope (`EnvState::Idle`, `Attack`, `Release`). "Holding" is not a
+distinct state — it is the Attack state with level snapped to 1.0.
 
 ```
 State machine:
@@ -111,19 +111,30 @@ State machine:
                   └─────── note_on() from any state ────────┘  (retrigger from current level)
 ```
 
+**Curve shape:** Both phases use one-pole exponential curves, producing the convex attack (fast
+initial rise, settling toward peak) and concave release (fast initial drop, long tail) characteristic
+of vactrol-based envelopes. This replaces the original linear ramps for more musical, "plucky"
+behavior.
+
+**Coefficient math:** `coeff = exp(−NUM_TC / duration_samples)`, where `NUM_TC = −ln(1e-4) ≈ 9.21`.
+This ensures the user-specified duration in milliseconds corresponds to the time to reach within
+−80 dB of the target value. The coefficient is computed once at note-on/note-off boundaries (via
+`set_attack()`/`set_release()`), never per-sample.
+
+**Threshold snap:** Exponential curves asymptotically approach but never reach their target. When
+the level is within `IDLE_THRESHOLD` (1e-4, ≈ −80 dB) of the target, it snaps to the exact value.
+This prevents denormalized floats and ensures clean state transitions.
+
 State transition rules:
-- **`note_on()`**: enters `Attack` from the current level (preserves level on retrigger). The
-  attack increment is scaled to the remaining distance: `(1.0 - level) / attack_samples`, so
-  retrigger from a non-zero level still takes the full attack duration to reach 1.0.
-- **Attack**: increments `level` by `attack_increment` per sample; clamps at 1.0 (stays here
-  until NoteOff arrives)
-- **`note_off()`**: enters `Release` from any non-Idle state. The release decrement is computed
-  from the level at the moment `note_off()` is called, so a mid-attack release ramps from the
-  current level (not from 1.0). If level is 0.0 (e.g., note_off immediately after note_on),
-  transitions directly to Idle.
-- **Release**: decrements `level` by `current_level_at_release_start / release_samples` per sample
-  (linear ramp from wherever the envelope currently is, to zero, over `release_samples`); when
-  `level ≤ 0` → `Idle`
+- **`note_on()`**: enters `Attack` from the current level (preserves level on retrigger).
+  With exponential curves, the coefficient is level-independent — retrigger from a higher level
+  naturally reaches 1.0 sooner (less remaining distance).
+- **Attack**: `level = 1.0 − (1.0 − level) × attack_coeff` per sample; snaps to 1.0 when within
+  threshold (stays here until NoteOff arrives)
+- **`note_off()`**: enters `Release` from any non-Idle state. If level is below the idle threshold
+  (e.g., note_off immediately after note_on), transitions directly to Idle.
+- **Release**: `level *= release_coeff` per sample (exponential decay toward 0.0); when
+  `level ≤ IDLE_THRESHOLD` → snaps to 0.0 → `Idle`
 - **Idle**: outputs 0.0
 
 **Phase retrigger on NoteOn:** Phase reset behavior depends on context:
@@ -402,14 +413,19 @@ Tests live in `#[cfg(test)]` blocks in the same file as the struct under test.
 - `fine_tune_1200_cents_octave_up` — 1200 cents doubles the frequency
 
 **`envelope.rs`:**
+- `num_tc_matches_idle_threshold` — verifies NUM_TC constant equals −ln(IDLE_THRESHOLD)
 - `idle_outputs_zero` — fresh envelope outputs 0.0
 - `attack_ramps_up` — after `note_on()`, samples increase monotonically from 0 toward 1.0
-- `attack_reaches_one` — after enough samples (≥ attack_samples), level is exactly 1.0
+- `attack_reaches_one` — after enough samples (≥ attack duration), level snaps to exactly 1.0
+- `attack_is_convex` — exponential attack: per-sample increments decrease over time
 - `hold_stays_at_one` — once attack completes, level remains 1.0 until `note_off()` is called
 - `release_ramps_down` — after `note_off()`, samples decrease monotonically
 - `release_reaches_idle` — after enough samples, state is `Idle` and level is 0.0
+- `release_is_concave` — exponential release: early drop is larger than late drop
 - `retrigger_preserves_level` — calling `note_on()` mid-attack preserves the current level
 - `retrigger_during_release_preserves_level` — calling `note_on()` mid-release preserves the current level
+- `retrigger_from_higher_level_reaches_one_sooner` — exponential: less remaining distance = faster completion
+- `retrigger_attack_completes_within_attack_time` — retrigger completes within configured attack duration
 
 **`wavefold.rs`:**
 - `zero_fold_is_identity` — fold=0 returns input unchanged
