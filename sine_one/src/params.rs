@@ -190,12 +190,6 @@ impl SineOneParams {
         params
     }
 
-    /// Create params with a custom fold amount (0–1) for testing.
-    pub fn with_fold(fold: f32) -> Self {
-        let mut params = Self::default();
-        params.fold = Self::build_fold(fold);
-        params
-    }
 }
 
 #[cfg(test)]
