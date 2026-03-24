@@ -10,9 +10,10 @@
 
 SineOne is a minimal polyphonic sine-wave synthesizer CLAP plugin. It accepts MIDI NoteOn/NoteOff
 events, plays up to 8 simultaneous sine oscillators tuned to incoming note pitches, shapes each
-voice's timbre with a sine wavefolder, and controls amplitude with a two-stage AR (Attack/Release)
-envelope. There is no filter, no GUI, and no effects beyond the built-in wavefolder. The entire
-codebase is intentionally small so every line is traceable back to a design decision documented here.
+voice's timbre with a sine wavefolder and an envelope-coupled lowpass gate (LPG), and controls
+amplitude with a two-stage AR (Attack/Release) envelope. There is no GUI and no effects beyond the
+built-in wavefolder and LPG. The entire codebase is intentionally small so every line is traceable
+back to a design decision documented here.
 
 ---
 
@@ -37,13 +38,13 @@ stereo field. With no PolyPan event, output defaults to center (equal L/R).
 ## DSP Architecture
 
 ```
-                 ┌──────────────────── Voice 0 ──────────────────────────┐
-MIDI NoteOn ──►  │ SineOscillator → Wavefold → ArEnvelope → Vel → Pan   │──┐
-allocate_voice() └──────────────────────────────────────────────────────┘  │
-                 ┌──────────────────── Voice 1 ──────────────────────────┐  ├─► Sum → Gain(1/√N) → Output Gain → [L,R]
-                 │ SineOscillator → Wavefold → ArEnvelope → Vel → Pan   │──┤
-                 └──────────────────────────────────────────────────────┘  │
-                 ...up to Voice 7                                          ┘
+                 ┌──────────────────────── Voice 0 ─────────────────────────────────┐
+MIDI NoteOn ──►  │ SineOscillator → Wavefold → LPG(SVF) → ArEnvelope → Vel → Pan   │──┐
+allocate_voice() └──────────────────────────────────────────────────────────────────┘  │
+                 ┌──────────────────────── Voice 1 ─────────────────────────────────┐  ├─► Sum → Gain(1/√N) → Output Gain → [L,R]
+                 │ SineOscillator → Wavefold → LPG(SVF) → ArEnvelope → Vel → Pan   │──┤
+                 └──────────────────────────────────────────────────────────────────┘  │
+                 ...up to Voice 7                                                      ┘
 MIDI NoteOff ──► oldest voice with matching note → Release phase
 MIDI PolyPan ──► voice with matching note → update pan gains
 ```
@@ -96,6 +97,52 @@ signal flow.
 
 **Smoothing:** The `fold` parameter is smoothed at 20ms (matching `fine_tune`) to prevent zipper
 noise when automated. The smoothed value is read per-sample in `process()`.
+
+### Lowpass Gate (LPG)
+
+A Cytomic/Simper state variable filter (SVF) whose cutoff is coupled to the AR envelope level,
+creating the signature lowpass gate behavior: timbre and amplitude decay together, with high
+frequencies dying first.
+
+**Filter type:** 2-pole SVF (topology-preserving transform). The SVF remains stable under
+per-sample coefficient modulation, which is essential since the cutoff tracks the envelope
+every sample. Reference: Andrew Simper, "Linear Trapezoidal Integrated SVF" (2013).
+
+**Cutoff mapping:** Log-frequency interpolation between `MIN_CUTOFF_HZ` (20 Hz) and the
+user's `LPG Cutoff` parameter, modulated by envelope level and LPG depth:
+
+```
+log_fc = (1 − lpg_depth) × ln(max_cutoff) + lpg_depth × (ln(20) + env_level × (ln(max_cutoff) − ln(20)))
+fc = exp(log_fc)
+```
+
+- `lpg_depth = 0`: cutoff stays at `max_cutoff` (filter transparent, bypassed entirely)
+- `lpg_depth = 1, env = 0`: cutoff = 20 Hz (filter nearly closed)
+- `lpg_depth = 1, env = 1`: cutoff = `max_cutoff` (filter fully open)
+
+**Resonance mapping:** Exponential mapping from the user's 0–1 parameter to SVF Q:
+
+```
+Q = Q_MIN × (Q_MAX / Q_MIN) ^ resonance
+Q_MIN = 1/√2 ≈ 0.707 (Butterworth — flat passband)
+Q_MAX = 20.0 (strong resonant peak)
+```
+
+**Bypass:** When `lpg_depth = 0`, the SVF is skipped entirely — no `tan()` call, no state
+update. This preserves the current signal path behavior at the default setting.
+
+**Signal chain position:** The SVF sits between the wavefolder and the envelope amplitude
+multiplication. The envelope level is sampled once per sample and used for both the cutoff
+calculation and the amplitude scaling. This creates the characteristic LPG coupling where
+filter and amplitude are driven by the same control signal.
+
+**Why this sounds like an LPG:** As the envelope decays, the filter cutoff drops simultaneously
+with the amplitude. High frequencies disappear first, mimicking the behavior of a vactrol-based
+lowpass gate (like the Buchla 292) where the CdS photoresistor controls both filter cutoff and
+signal amplitude through the same physical mechanism.
+
+**Smoothing:** All three LPG parameters (`lpg`, `lpg_cutoff`, `lpg_resonance`) are smoothed at
+20ms to prevent zipper noise when automated.
 
 ### ArEnvelope
 
@@ -218,15 +265,15 @@ gain compensation.
 ### Voice Architecture
 
 ```
-                 ┌─ Voice 0: Osc → Fold → Env → Vel → Pan ─┐
-MIDI NoteOn ──►  ├─ Voice 1: Osc → Fold → Env → Vel → Pan ─┤──► Sum ──► Gain(1/√N) ──► Output Gain ──► [L,R]
-                 ├─ Voice 2: ...                             ┤
-allocate_voice() └─ Voice N-1: ...                           ┘
+                 ┌─ Voice 0: Osc → Fold → LPG → Env → Vel → Pan ─┐
+MIDI NoteOn ──►  ├─ Voice 1: Osc → Fold → LPG → Env → Vel → Pan ─┤──► Sum ──► Gain(1/√N) ──► Output Gain ──► [L,R]
+                 ├─ Voice 2: ...                                   ┤
+allocate_voice() └─ Voice N-1: ...                                 ┘
 ```
 
-Each `Voice` struct (in `dsp/voice.rs`) bundles `SineOscillator`, `ArEnvelope`, `LinearSmoother`
-(velocity), pan gains, a MIDI note, a base frequency, and a monotonic age counter. All fields are
-stack-allocated — no heap allocation in the audio path.
+Each `Voice` struct (in `dsp/voice.rs`) bundles `SineOscillator`, `SvfFilter` (LPG),
+`ArEnvelope`, `LinearSmoother` (velocity), pan gains, a MIDI note, a base frequency, and a
+monotonic age counter. All fields are stack-allocated — no heap allocation in the audio path.
 
 ### Voice Stealing: Oldest Voice with Release Priority
 
@@ -291,12 +338,16 @@ When `Voices` increases: no immediate effect. New slots become available for the
 | Release | `"release"` | `FloatParam` | 1 to 10000 | 300.0 | `None` | ms | Skewed (log-ish feel) |
 | Start Phase | `"start_phase"` | `FloatParam` | 0 to 360 | 0.0 | `None` | ° | Oscillator phase on NoteOn |
 | Fold | `"fold"` | `FloatParam` | 0 to 1 | 0.0 | `Linear(20ms)` | % | Wavefolder amount; 0 = bypass |
+| LPG | `"lpg"` | `FloatParam` | 0 to 1 | 0.0 | `Linear(20ms)` | % | Envelope→cutoff depth; 0 = bypass |
+| LPG Cutoff | `"lpg_cutoff"` | `FloatParam` | 20 to 20000 | 20000.0 | `Linear(20ms)` | Hz | Max cutoff when envelope = 1.0; skewed |
+| LPG Resonance | `"lpg_resonance"` | `FloatParam` | 0 to 1 | 0.0 | `Linear(20ms)` | % | SVF Q; 0 = Butterworth (flat) |
 | Voices | `"voices"` | `IntParam` | 1 to 8 | 1 | `None` | — | Polyphonic voice count |
 | Output Gain | `"output_gain"` | `FloatParam` | −24 to +12 | 0.0 | `None` | dB | Attenuverter; read per-block |
 
 **Notes on smoothing choices:**
-- `Fine Tune` and `Fold` use `Linear(20ms)` so pitch and timbre slide smoothly when automated
-  (avoids zipper noise). Both are read per-sample in `process()`.
+- `Fine Tune`, `Fold`, and the three LPG parameters use `Linear(20ms)` so pitch, timbre, and
+  filter settings slide smoothly when automated (avoids zipper noise). All are read per-sample
+  in `process()`.
 - `Attack` and `Release` use `None` because they control the *shape* of the next envelope, not a
   sample-by-sample audio signal. Their value is read at note-on/note-off boundaries, not
   per-sample. Smoothing here would be meaningless.
@@ -315,7 +366,7 @@ the display name on purpose.
 
 ## State & Preset Design
 
-All plugin state is captured by the seven `Params` fields — no custom serialization needed. When
+All plugin state is captured by the ten `Params` fields — no custom serialization needed. When
 the DAW saves a project or preset, nih-plug serializes the `Params` struct automatically via the
 `#[derive(Params)]` macro.
 
@@ -343,11 +394,12 @@ sine-one/
         ├── plugin.rs       # SineOne struct + Plugin trait impl (process, initialize, reset)
         ├── params.rs       # SineOneParams struct with six FloatParams + one IntParam
         ├── dsp/
-        │   ├── mod.rs      # pub mod oscillator; envelope; pan; smoother; voice; wavefold;
+        │   ├── mod.rs      # pub mod oscillator; envelope; pan; smoother; svf; voice; wavefold;
         │   ├── oscillator.rs   # SineOscillator: phase, set_frequency(), next_sample(), reset()
         │   ├── envelope.rs     # ArEnvelope: EnvState enum, ArEnvelope struct, all methods
         │   ├── smoother.rs     # LinearSmoother: linear ramp for click-free parameter transitions
         │   ├── pan.rs          # apply_constant_power_pan(): stereo panning via sin/cos pan law
+        │   ├── svf.rs          # SvfFilter: Cytomic SVF; compute_lpg_cutoff(); resonance_to_q()
         │   ├── wavefold.rs     # wavefold(): sine wavefolder with bypass at zero
         │   └── voice.rs        # Voice: per-voice DSP bundle; allocate_voice(): voice stealing
         └── main.rs         # standalone binary: nih_export_standalone::<SineOne>()
@@ -557,19 +609,22 @@ If this produces zero failures, you're safe to load in Bitwig.
 
 Target: process a 512-sample block well under the ~11.6ms audio deadline at 44100 Hz.
 
-Seven benchmarks in `benches/dsp_bench.rs`, organized into three Criterion groups. All benchmarks
+Nine benchmarks in `benches/dsp_bench.rs`, organized into three Criterion groups. All benchmarks
 report throughput in samples/second via `Throughput::Elements`.
 
 **Group 1: `component`** — isolated DSP primitives for diagnostic isolation:
 - `oscillator_512` — sine oscillator: phase accumulation + `sin()`
 - `envelope_attack_512` — envelope attack ramp (recreated per iteration)
 - `combined_dsp_512` — oscillator × envelope × velocity (recreated per iteration)
+- `wavefold_512` — sine wavefolder with `black_box`'d fold amount
+- `svf_filter_512` — Cytomic SVF lowpass with envelope-modulated cutoff and resonance
 - `apply_detune_512` — `2^(cents/1200)` via `powf()` with `black_box`'d inputs to prevent
   constant-folding
 
 **Group 2: `voice`** — production hot path at the Voice level:
 - `single_voice_512` — full `Voice::render_sample()` with non-zero fine-tune (exercises `powf`,
-  oscillator, envelope, velocity smoother, and pan smoothers)
+  oscillator, envelope, velocity smoother, and pan smoothers) — LPG off
+- `single_voice_lpg_512` — same as above with LPG active (depth=1.0, cutoff=5kHz, resonance=0.3)
 - `8_voices_512` — 8 active voices summed to stereo with gain compensation (worst-case polyphony)
 
 **Group 3: `realtime`** — single scalar metric for automated optimization:
@@ -580,7 +635,7 @@ report throughput in samples/second via `Throughput::Elements`.
   11,609,977 ns = 512 / 44100 seconds, the audio deadline).
 
 ```bash
-cargo bench                          # run all 7 benchmarks
+cargo bench                          # run all 9 benchmarks
 cargo bench -- "realtime/8v_512"     # run only the scalar metric
 ```
 

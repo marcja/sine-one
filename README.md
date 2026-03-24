@@ -13,12 +13,13 @@ workflow with every design decision documented — not a feature-rich instrument
 - Plays a sine oscillator tuned to the incoming note and velocity
 - Polyphonic: 1–8 voices with voice stealing (oldest releasing, then oldest active)
 - Sine wavefolder for timbral control — from pure sine (0%) to harmonically rich (100%)
-- Shapes the output with a linear AR (Attack/Release) envelope
+- Lowpass gate (LPG) — envelope-coupled SVF filter for vactrol-like timbral decay
+- Shapes the output with an exponential AR (Attack/Release) envelope
 - Responds to **PolyPan** note expression events for stereo panning (e.g., from Bitwig's Randomize device)
 - Attack-gated start-phase transient: short attacks (< 10 ms) allow an intentional amplitude pop from non-zero start phase; long attacks suppress it
 - Gain-compensated voice summing (1/√N) so perceived loudness stays constant as voice count changes
 - Click-free retriggers: velocity and pan ramp over ~2 ms on voice reuse; phase continues rather than resetting
-- No filter, no GUI
+- No GUI
 
 ### Parameters
 
@@ -29,6 +30,9 @@ workflow with every design decision documented — not a feature-rich instrument
 | **Release** | 1–10000 ms | 300 ms | Log-skewed; read at note-off boundaries |
 | **Start Phase** | 0–360° | 0° | Oscillator phase on NoteOn from silence |
 | **Fold** | 0–100% | 0% | Wavefolder amount; 0 = bypass (pure sine), 100 = max folding |
+| **LPG** | 0–100% | 0% | Envelope→cutoff depth; 0 = filter bypassed |
+| **LPG Cutoff** | 20–20000 Hz | 20000 Hz | Max filter cutoff when envelope = 1.0; log-skewed |
+| **LPG Resonance** | 0–100% | 0% | SVF resonance; 0 = flat (Butterworth), 100 = strong peak |
 | **Voices** | 1–8 | 1 | Polyphonic voice count; 1 = monophonic behavior |
 | **Output Gain** | −24 to +12 dB | 0 dB | Final scaling after voice gain compensation |
 
@@ -73,12 +77,13 @@ sine-one/
     └── src/
         ├── lib.rs          # nih_export_clap! macro entry point
         ├── plugin.rs       # SineOne struct + Plugin trait (initialize, reset, process)
-        ├── params.rs       # SineOneParams — seven CLAP parameters
+        ├── params.rs       # SineOneParams — ten CLAP parameters
         ├── main.rs         # standalone binary entry point
         └── dsp/
             ├── mod.rs
             ├── oscillator.rs   # SineOscillator — phase accumulator + frequency math
             ├── envelope.rs     # ArEnvelope — Idle/Attack/Release state machine
+            ├── svf.rs          # SvfFilter — Cytomic SVF; LPG cutoff/resonance mapping
             ├── wavefold.rs     # wavefold() — sine wavefolder with bypass at zero
             ├── voice.rs        # Voice — per-voice DSP path + voice allocation
             ├── pan.rs          # Constant-power stereo panning (sin/cos pan law)
@@ -169,8 +174,8 @@ Criterion benchmarks are organized in three groups:
 
 | Group | What it measures |
 |---|---|
-| **component** | Individual DSP units: oscillator, envelope, combined osc×env, `apply_detune` — all at 512 samples |
-| **voice** | Single voice and 8-voice polyphonic rendering (512 samples) |
+| **component** | Individual DSP units: oscillator, envelope, combined osc×env, wavefold, SVF filter, `apply_detune` — all at 512 samples |
+| **voice** | Single voice (LPG off), single voice (LPG on), and 8-voice polyphonic rendering (512 samples) |
 | **realtime** | 8-voice 512-sample buffer vs. the 11.6 ms hardware deadline at 44100 Hz; computes real-time ratio (median time / deadline × 100%) |
 
 Sets a regression baseline on first run; subsequent runs report statistical regressions.
@@ -183,12 +188,12 @@ HTML reports are generated in `target/criterion/`.
 After installing and rescanning, verify the following manually:
 
 1. Plugin appears in the Bitwig instrument browser under **SineOne**
-2. All seven parameters appear in the device panel with correct ranges
+2. All ten parameters appear in the device panel with correct ranges
 3. A MIDI note produces a sine tone
 4. Attack = 500 ms: note fades in audibly over half a second
 5. Release = 1000 ms: note fades out after key release
 6. Fine Tune automated from −100 to +100 cents: pitch sweeps smoothly, no zipper noise
-7. Save project, close, reopen: all seven parameters restore correctly
+7. Save project, close, reopen: all ten parameters restore correctly
 8. Rapid repeated MIDI notes produce no audible clicks
 9. Randomize device → Pan: signal moves in the stereo field between notes
 10. Voices = 4: play a chord — all four notes sound simultaneously
@@ -198,6 +203,11 @@ After installing and rescanning, verify the following manually:
 14. Start Phase = 0°, Attack = 1 ms: note begins cleanly (no pop)
 15. Output Gain = −12 dB: output is noticeably quieter than 0 dB
 16. Fold = 50%: tone is audibly different (richer) than Fold = 0%; automation sweeps smoothly
+17. LPG = 0%: sound unchanged from previous behavior (pure sine or wavefold only)
+18. LPG = 100%, Cutoff = 20 kHz: envelope-coupled filtering audible on plucks (highs decay first)
+19. LPG = 100%, Cutoff = 500 Hz: dark, muted pluck character
+20. LPG Resonance = 80%: metallic ping on attack transient
+21. Automate LPG depth: no zipper noise during sweep
 
 ---
 
