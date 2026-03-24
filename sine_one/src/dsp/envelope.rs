@@ -14,52 +14,78 @@ pub enum EnvState {
     Release,
 }
 
-/// A linear Attack/Release envelope generator.
+/// Threshold below which the envelope snaps to its target (0.0 or 1.0).
+/// 1e-4 is approximately −80 dB — inaudible.
+const IDLE_THRESHOLD: f32 = 1e-4;
+
+/// Number of time constants that fit in the user-specified duration.
+/// Derived from: exp(−NUM_TC) = IDLE_THRESHOLD, so NUM_TC = −ln(IDLE_THRESHOLD).
+/// With IDLE_THRESHOLD = 1e-4: NUM_TC = ln(10000) ≈ 9.2103.
+/// This means "attack_ms" = time to reach within −80 dB of peak,
+/// and "release_ms" = time to decay to −80 dB.
+const NUM_TC: f32 = 9.2103;
+
+/// An exponential Attack/Release envelope generator.
+///
+/// Uses one-pole exponential curves for both phases, producing the convex attack
+/// (fast rise, settling toward peak) and concave release (fast initial drop, long tail)
+/// characteristic of vactrol-based envelopes.
 ///
 /// - `note_on()` enters Attack from the current level (preserves level on retrigger).
-/// - During Attack, level increments by `attack_increment` (= (1.0 - level) / attack_samples)
-///   each sample, clamping at 1.0 and holding there until `note_off()`. The increment is
-///   scaled to the remaining distance so retrigger from a non-zero level still takes the
-///   full attack duration.
-/// - `note_off()` enters Release from any non-Idle state. The release decrement is computed
-///   from the level at the moment note_off() is called, so a mid-attack release ramps from
-///   the current level (not from 1.0).
-/// - During Release, level decrements by `release_decrement` each sample. When level ≤ 0 → Idle.
-#[derive(Default)]
+/// - During Attack, the remaining distance to 1.0 decays exponentially:
+///   `level = 1.0 − (1.0 − level) × attack_coeff`. When level reaches within
+///   IDLE_THRESHOLD of 1.0, it snaps to 1.0 and holds until `note_off()`.
+/// - `note_off()` enters Release from any non-Idle state.
+/// - During Release, level decays exponentially: `level *= release_coeff`.
+///   When level falls below IDLE_THRESHOLD, it snaps to 0.0 → Idle.
 pub struct ArEnvelope {
     state: EnvState,
     /// Current envelope amplitude in [0.0, 1.0].
     level: f32,
-    /// Per-sample increment during Attack: (1.0 - level) / attack_samples.
-    /// Recomputed on each note_on() so retrigger from a non-zero level
-    /// still takes the full attack duration to reach 1.0.
-    attack_increment: f32,
-    /// Duration of the attack phase in samples. Stored so note_on() can
-    /// recompute attack_increment from the current level.
-    attack_samples: f32,
-    /// Per-sample decrement during Release: level_at_release_start / release_samples.
-    release_decrement: f32,
-    /// Number of samples in the release phase (stored so we can compute decrement on note_off).
-    release_samples: f32,
+    /// Per-sample coefficient for exponential approach to 1.0 during Attack.
+    /// In (0, 1): closer to 1.0 = slower attack. Computed from attack_ms in set_attack().
+    attack_coeff: f32,
+    /// Per-sample coefficient for exponential decay toward 0.0 during Release.
+    /// In (0, 1): closer to 1.0 = slower release. Computed from release_ms in set_release().
+    release_coeff: f32,
+}
+
+impl Default for ArEnvelope {
+    fn default() -> Self {
+        Self {
+            state: EnvState::default(),
+            level: 0.0,
+            // Coefficient of 1.0 = infinitely slow (no change per sample).
+            // Safe default: note_on() without set_attack() holds at current level.
+            attack_coeff: 1.0,
+            release_coeff: 1.0,
+        }
+    }
 }
 
 impl ArEnvelope {
     /// Configure the attack time. Call when sample rate changes or when the attack parameter
     /// is read at a note-on boundary.
     ///
+    /// Computes the exponential coefficient: `attack_coeff = exp(−NUM_TC / attack_samples)`.
     /// `attack_ms` is clamped to a minimum of 1.0 to avoid division by zero.
     pub fn set_attack(&mut self, attack_ms: f32, sample_rate: f32) {
-        // Convert milliseconds to samples: ms * (samples/sec) / (1000 ms/sec).
-        self.attack_samples = (attack_ms * sample_rate / 1000.0).max(1.0);
+        // Convert milliseconds to samples: ms × (samples/sec) / (1000 ms/sec).
+        let attack_samples = (attack_ms * sample_rate / 1000.0).max(1.0);
+        // exp(−NUM_TC / N): the remaining distance to 1.0 shrinks by this factor each sample.
+        self.attack_coeff = (-NUM_TC / attack_samples).exp();
     }
 
     /// Configure the release time. Call when sample rate changes or when the release parameter
     /// is read at a note-off boundary.
     ///
+    /// Computes the exponential coefficient: `release_coeff = exp(−NUM_TC / release_samples)`.
     /// `release_ms` is clamped to a minimum of 1.0 to avoid division by zero.
     pub fn set_release(&mut self, release_ms: f32, sample_rate: f32) {
-        // Store release duration in samples for computing the decrement at note_off().
-        self.release_samples = (release_ms * sample_rate / 1000.0).max(1.0);
+        // Convert milliseconds to samples: ms × (samples/sec) / (1000 ms/sec).
+        let release_samples = (release_ms * sample_rate / 1000.0).max(1.0);
+        // exp(−NUM_TC / N): level multiplied by this factor each sample during release.
+        self.release_coeff = (-NUM_TC / release_samples).exp();
     }
 
     /// Trigger the attack phase. Preserves the current level so retrigger
@@ -71,32 +97,29 @@ impl ArEnvelope {
     /// Trigger the attack phase with an explicit initial level.
     ///
     /// Sets the envelope level to `initial_level` (clamped to [0.0, 1.0]) and
-    /// enters Attack, ramping from that level to 1.0 over the configured attack
-    /// duration. Contrast with `note_on()`, which preserves the current level.
+    /// enters Attack, approaching 1.0 exponentially. With exponential curves,
+    /// the coefficient is level-independent — no per-trigger recomputation needed.
+    /// Contrast with `note_on()`, which preserves the current level.
     pub fn note_on_at_level(&mut self, initial_level: f32) {
         self.level = initial_level.clamp(0.0, 1.0);
-        let remaining = (1.0 - self.level).max(0.0);
-        self.attack_increment = remaining / self.attack_samples;
         self.state = EnvState::Attack;
     }
 
     /// Trigger the release phase from any non-Idle state.
     ///
-    /// Computes the release decrement from the current level so the ramp always
-    /// reaches zero in exactly `release_samples`, regardless of where in the
-    /// attack/hold the note was released.
+    /// With exponential release, the coefficient is level-independent — no
+    /// per-trigger recomputation needed. The level decays toward 0.0 at the
+    /// same rate regardless of where in the attack/hold the note was released.
     pub fn note_off(&mut self) {
         if self.state == EnvState::Idle {
             return;
         }
-        // Compute decrement so level reaches 0 in release_samples from current level.
-        // If level is 0 (e.g., note_off immediately after note_on), go straight to Idle.
-        if self.level <= 0.0 {
+        // If level is effectively zero, go straight to Idle.
+        if self.level <= IDLE_THRESHOLD {
             self.state = EnvState::Idle;
             self.level = 0.0;
             return;
         }
-        self.release_decrement = self.level / self.release_samples;
         self.state = EnvState::Release;
     }
 
@@ -105,16 +128,19 @@ impl ArEnvelope {
         match self.state {
             EnvState::Idle => 0.0,
             EnvState::Attack => {
-                self.level += self.attack_increment;
-                // Clamp at 1.0 and hold there until note_off().
-                if self.level >= 1.0 {
+                // Exponential approach to 1.0: remaining distance shrinks by attack_coeff.
+                self.level = 1.0 - (1.0 - self.level) * self.attack_coeff;
+                // Snap to 1.0 when within threshold (exponential never reaches target exactly).
+                if self.level >= 1.0 - IDLE_THRESHOLD {
                     self.level = 1.0;
                 }
                 self.level
             }
             EnvState::Release => {
-                self.level -= self.release_decrement;
-                if self.level <= 0.0 {
+                // Exponential decay toward 0.0: level shrinks by release_coeff each sample.
+                self.level *= self.release_coeff;
+                // Snap to 0.0 when below threshold to prevent denormals and reach Idle.
+                if self.level <= IDLE_THRESHOLD {
                     self.level = 0.0;
                     self.state = EnvState::Idle;
                 }
@@ -141,8 +167,9 @@ impl ArEnvelope {
     pub fn reset(&mut self) {
         self.state = EnvState::Idle;
         self.level = 0.0;
-        self.attack_increment = 0.0;
-        self.release_decrement = 0.0;
+        // Coefficient of 1.0 = infinitely slow (safe default, same as Default::default()).
+        self.attack_coeff = 1.0;
+        self.release_coeff = 1.0;
     }
 }
 
@@ -165,6 +192,15 @@ mod tests {
         env.set_attack(attack_ms, TEST_SAMPLE_RATE);
         env.set_release(release_ms, TEST_SAMPLE_RATE);
         env
+    }
+
+    #[test]
+    fn num_tc_matches_idle_threshold() {
+        let expected = -(IDLE_THRESHOLD.ln());
+        assert!(
+            (NUM_TC - expected).abs() < 1e-3,
+            "NUM_TC ({NUM_TC}) != -ln(IDLE_THRESHOLD) ({expected})"
+        );
     }
 
     #[test]
@@ -438,23 +474,133 @@ mod tests {
     }
 
     #[test]
-    fn retrigger_attack_duration_matches_full_attack() {
-        // When retriggering mid-release, the attack phase should still take
-        // the full attack_ms to reach 1.0 (scaled increment), not a fraction
-        // of it (fixed increment).
-        let attack_ms = 10.0;
-        let release_ms = 100.0;
-        let attack_samples = ms_to_samples(attack_ms); // 441
-
-        let mut env = make_envelope(attack_ms, release_ms);
+    fn attack_is_convex() {
+        // Exponential attack: increments should decrease over time
+        // (fast initial rise, settling toward peak).
+        let attack_ms = 50.0;
+        let mut env = make_envelope(attack_ms, 100.0);
         env.note_on();
 
-        // Complete attack + hold briefly.
+        let attack_samples = ms_to_samples(attack_ms);
+        let quarter = attack_samples / 4;
+
+        // Measure level at 25% and 50% of attack time.
+        for _ in 0..quarter {
+            env.next_sample();
+        }
+        let level_25 = env.level;
+
+        for _ in 0..quarter {
+            env.next_sample();
+        }
+        let level_50 = env.level;
+
+        for _ in 0..quarter {
+            env.next_sample();
+        }
+        let level_75 = env.level;
+
+        // Early increment (0→25%) should be larger than late increment (50→75%).
+        let early_increment = level_25; // from 0.0 to level_25
+        let late_increment = level_75 - level_50;
+        assert!(
+            early_increment > late_increment,
+            "attack should be convex: early increment ({early_increment}) > late increment ({late_increment})"
+        );
+    }
+
+    #[test]
+    fn release_is_concave() {
+        // Exponential release: early drop should be larger than late drop
+        // (fast initial decay, long tail).
+        let release_ms = 100.0;
+        let mut env = make_envelope(10.0, release_ms);
+        env.note_on();
+
+        // Complete attack.
+        let attack_samples = ms_to_samples(10.0);
         for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
 
-        // Release partway — level drops to ~0.5.
+        env.note_off();
+
+        let release_samples = ms_to_samples(release_ms);
+        let quarter = release_samples / 4;
+
+        // Measure level at 25% and 50% of release time.
+        for _ in 0..quarter {
+            env.next_sample();
+        }
+        let level_25 = env.level;
+
+        for _ in 0..quarter {
+            env.next_sample();
+        }
+        let level_50 = env.level;
+
+        for _ in 0..quarter {
+            env.next_sample();
+        }
+        let level_75 = env.level;
+
+        // Early drop (100%→25%) should be larger than late drop (50%→75%).
+        let early_drop = 1.0 - level_25;
+        let late_drop = level_50 - level_75;
+        assert!(
+            early_drop > late_drop,
+            "release should be concave: early drop ({early_drop}) > late drop ({late_drop})"
+        );
+    }
+
+    /// Count samples until the envelope reaches 1.0 (within tolerance), or `max` if it never does.
+    fn samples_to_reach_one(env: &mut ArEnvelope, max: usize) -> usize {
+        for i in 0..max {
+            if (env.next_sample() - 1.0).abs() < 1e-6 {
+                return i;
+            }
+        }
+        max
+    }
+
+    #[test]
+    fn retrigger_from_higher_level_reaches_one_sooner() {
+        // With exponential attack, retrigger from 0.5 should reach 1.0
+        // in fewer samples than from 0.0 (less remaining distance).
+        let attack_ms = 10.0;
+        let max_samples = ms_to_samples(attack_ms) + 100;
+
+        let mut env_from_zero = make_envelope(attack_ms, 100.0);
+        env_from_zero.note_on();
+        let samples_from_zero = samples_to_reach_one(&mut env_from_zero, max_samples);
+
+        let mut env_from_half = make_envelope(attack_ms, 100.0);
+        env_from_half.note_on_at_level(0.5);
+        let samples_from_half = samples_to_reach_one(&mut env_from_half, max_samples);
+
+        assert!(
+            samples_from_half < samples_from_zero,
+            "retrigger from 0.5 should reach 1.0 sooner ({samples_from_half}) than from 0.0 ({samples_from_zero})"
+        );
+    }
+
+    #[test]
+    fn retrigger_attack_completes_within_attack_time() {
+        // After retrigger from mid-release, the attack should still complete
+        // within the configured attack_ms (plus margin for threshold snap).
+        let attack_ms = 10.0;
+        let release_ms = 100.0;
+
+        let mut env = make_envelope(attack_ms, release_ms);
+        env.note_on();
+
+        // Complete attack + hold.
+        let attack_samples = ms_to_samples(attack_ms);
+        for _ in 0..attack_samples + 10 {
+            env.next_sample();
+        }
+
+        // Release partway.
         env.note_off();
         let half_release = ms_to_samples(release_ms) / 2;
         for _ in 0..half_release {
@@ -462,31 +608,15 @@ mod tests {
         }
         let level_at_retrigger = env.level;
         assert!(
-            level_at_retrigger > 0.3 && level_at_retrigger < 0.7,
+            level_at_retrigger > 0.0 && level_at_retrigger < 1.0,
             "expected mid-release level, got {level_at_retrigger}"
         );
 
-        // Retrigger — attack should take full attack_samples to reach 1.0.
+        // Retrigger — should reach 1.0 within attack_samples (faster than
+        // from 0.0 because less remaining distance with exponential).
         env.set_attack(attack_ms, TEST_SAMPLE_RATE);
         env.note_on();
-
-        // After 75% of the attack time, level should NOT yet be 1.0.
-        // With the bug (fixed increment 1/441), starting from ~0.5, level
-        // would reach 1.0 in ~50% of attack time and be clamped here.
-        // With the fix (scaled increment 0.5/441), level would be ~0.875.
-        let check_samples = attack_samples * 3 / 4;
-        for _ in 0..check_samples {
-            env.next_sample();
-        }
-        assert!(
-            env.level < 1.0,
-            "level should not reach 1.0 after 75% of attack time on retrigger, got {}",
-            env.level
-        );
-
-        // After the full attack time (plus margin), level should be 1.0.
-        let remaining_samples = attack_samples - check_samples + 10;
-        for _ in 0..remaining_samples {
+        for _ in 0..attack_samples + 10 {
             env.next_sample();
         }
         assert!(
@@ -524,11 +654,12 @@ mod tests {
         let mut env = make_envelope(10.0, 100.0);
         env.note_on_at_level(0.5);
 
-        // First next_sample() should return ~0.5 + one attack increment.
-        // Remaining distance = 1.0 - 0.5 = 0.5, increment = 0.5 / 441.
+        // First next_sample() applies exponential approach:
+        // level = 1.0 - (1.0 - 0.5) * attack_coeff
+        let attack_samples = 10.0 * TEST_SAMPLE_RATE / 1000.0;
+        let attack_coeff = (-NUM_TC / attack_samples).exp();
+        let expected = 1.0 - (1.0 - 0.5) * attack_coeff;
         let sample = env.next_sample();
-        let expected_increment = 0.5 / (10.0 * TEST_SAMPLE_RATE / 1000.0);
-        let expected = 0.5 + expected_increment;
         assert!(
             (sample - expected).abs() < 1e-6,
             "first sample should be ~{expected}, got {sample}"
@@ -587,10 +718,13 @@ mod tests {
         env.set_attack(10.0, TEST_SAMPLE_RATE);
         env.note_on_at_level(-1.0);
         let sample = env.next_sample();
-        // Should behave like note_on_at_level(0.0): first sample = 0 + increment.
-        let expected_increment = 1.0 / (10.0 * TEST_SAMPLE_RATE / 1000.0);
+        // Should behave like note_on_at_level(0.0): first sample uses exponential
+        // approach from 0.0: level = 1.0 - (1.0 - 0.0) * attack_coeff.
+        let attack_samples = 10.0 * TEST_SAMPLE_RATE / 1000.0;
+        let attack_coeff = (-NUM_TC / attack_samples).exp();
+        let expected = 1.0 - attack_coeff;
         assert!(
-            (sample - expected_increment).abs() < 1e-6,
+            (sample - expected).abs() < 1e-6,
             "level < 0.0 should be clamped to 0.0, got {sample}"
         );
     }
@@ -630,27 +764,27 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_derived_increments() {
+    fn reset_clears_derived_coefficients() {
         let mut env = make_envelope(10.0, 100.0);
         env.note_on();
-        // Advance partway so attack_increment is non-zero.
+        // Advance partway so coefficients have been computed.
         for _ in 0..200 {
             env.next_sample();
         }
         env.note_off();
-        // release_decrement is now non-zero.
 
         env.reset();
 
-        // After reset, derived increments should be zero so that a note_on()
-        // without a preceding set_attack() produces no ramp (stays at 0.0).
+        // After reset, coefficients should be 1.0 (infinitely slow = no change),
+        // matching Default::default(). A note_on() without set_attack() produces
+        // no ramp (level stays at its current value).
         assert_eq!(
-            env.attack_increment, 0.0,
-            "attack_increment should be zero after reset"
+            env.attack_coeff, 1.0,
+            "attack_coeff should be 1.0 after reset"
         );
         assert_eq!(
-            env.release_decrement, 0.0,
-            "release_decrement should be zero after reset"
+            env.release_coeff, 1.0,
+            "release_coeff should be 1.0 after reset"
         );
     }
 }

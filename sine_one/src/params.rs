@@ -189,7 +189,6 @@ impl SineOneParams {
         params.output_gain = Self::build_output_gain(db);
         params
     }
-
 }
 
 #[cfg(test)]
